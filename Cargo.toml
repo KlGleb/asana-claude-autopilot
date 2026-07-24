@@ -1,0 +1,31 @@
+[package]
+name = "asana-claude-autopilot"
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+description = "A daemon that feeds Asana tasks to Claude Code sessions across multiple projects, with a CLI and a Telegram remote control"
+repository = "https://github.com/KlGleb/asana-claude-autopilot"
+
+[lib]
+name = "autopilot_core"
+path = "src/lib.rs"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+regex = "1"
+chrono = "0.4"
+
+[[bin]]
+name = "autopilot"
+path = "src/bin/autopilot.rs"
+
+[[bin]]
+name = "asana"
+path = "src/bin/asana.rs"
+
+[profile.release]
+strip = true
+lto = true

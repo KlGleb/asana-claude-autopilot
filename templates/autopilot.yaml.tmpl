@@ -1,0 +1,43 @@
+# Конфиг автопилота — проект {{PROJECT_NAME}}.
+# Читается демоном `autopilot` и CLI `asana` (поиск вверх от cwd или AUTOPILOT_DIR).
+
+asana:
+  # Имя переменной окружения с Asana Personal Access Token.
+  # Сам токен в файле НЕ хранится — только имя переменной.
+  token_env: {{TOKEN_ENV}}
+  # Workspace, по которому автопилот ищет задачи, назначенные на агента.
+  workspace: "{{WORKSPACE}}"
+
+roles:
+  # Человек-оператор: сюда возвращаются задачи (blocked/qa/несоответствие секций).
+  operator:
+    gid: "{{OPERATOR_GID}}"
+    label: {{OPERATOR_LABEL}}     # алиас для CLI: `asana assign <gid> {{OPERATOR_LABEL}}`
+  # Аккаунт-агент (Claude Code): автопилот берёт ТОЛЬКО назначенные на него задачи.
+  agent:
+    gid: "{{AGENT_GID}}"
+    name: "{{AGENT_NAME}}"        # отображаемое имя в Asana — для детекции авторства комментариев
+    label: {{AGENT_LABEL}}        # алиас для CLI: `asana assign <gid> {{AGENT_LABEL}}`
+
+# Роль -> имя секции на доске (резолв по имени, регистронезависимо).
+# Можно указать список синонимов на случай разных названий в разных проектах.
+sections:
+  todo:        ["todo", "To Do", "Бэклог"]
+  in_progress: ["in progress", "In Progress", "В работе"]
+  qa:          ["qa", "QA", "Тестирование"]
+  done:        ["done", "Done", "Готово"]
+  blocked:     ["blocked", "Blocked", "Заблокировано"]
+  reopen:      ["reopen", "Reopened", "Переоткрыто"]
+
+# Из каких ролей-секций автопилот берёт задачи в работу.
+approved: [todo, in_progress, reopen]
+
+heuristics:
+  # Слова в описании, при которых задача сразу уходит в blocked (нужен человек).
+  manual_keywords: [доступы, оплата, аккаунт, физические устройства, access, payment, account]
+  # Язык комментариев автопилота в Asana: ru | en
+  comment_language: ru
+
+prompt_file: prompt.md
+
+mismatch_comment: "Секции в текущем проекте не соответствуют процессу, задача не может быть выполнена"

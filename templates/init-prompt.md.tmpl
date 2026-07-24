@@ -1,0 +1,13 @@
+You are initializing the Asana autopilot for the project in the current directory ({{PROJECT_DIR}}).
+
+A template prompt has just been written to `autopilot/prompt.md`. Your ONLY job is to make its two placeholder sections match reality. Work quickly and precisely.
+
+1. Inspect the project: list top-level directories; for each git repository found, note its language/build system (look at build files), the current branch (`git branch --show-current`), the `origin` remote URL (`git remote get-url origin`), whether `develop` exists on origin (`git ls-remote --heads origin develop`), and skim its `CLAUDE.md`/`README` if present.
+
+2. Edit `autopilot/prompt.md`:
+   - Replace the `## Workspace Context` section body (the part marked with `<!-- AUTOPILOT-INIT: ... -->`) with the real repository list: one bullet per repo with its purpose, check/build/test commands, and branch. Remove the AUTOPILOT-INIT comment. Keep the note about reading CLAUDE.md/README.
+   - In the `## Git & delivery of changes` section, replace `<org>/<repo>` in the compare-link with the real GitHub org/repo names (list all repos if several), state the actual PR base branch for each repo, and remove the AUTOPILOT-INIT comment.
+
+3. Do NOT touch any other part of `autopilot/prompt.md`, do NOT modify `autopilot/autopilot.yaml`, do NOT commit or push anything, do NOT create other files.
+
+When done, print a one-paragraph summary of what you found (repos, branches, orgs).
