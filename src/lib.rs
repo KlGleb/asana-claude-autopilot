@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+pub mod claudecli;
 pub mod daemon;
 pub mod initproj;
 pub mod registry;

@@ -75,7 +75,15 @@ telegram:
 2. Start the daemon, message your bot — it replies with your chat id.
 3. Put the id into `telegram.allowed_chats`, run `autopilot restart`.
 
-Commands: `/status` (with inline buttons), `/pause <name>`, `/resume <name>`, `/priority <name> <n>`, `/logs <name>`. Buttons per project: ⏸/▶️ toggle, 🔼/🔽 priority, 📜 logs.
+The bot registers a command menu (Telegram's **Menu** button + autocomplete) and shows an inline **main menu** on `/start` / `/menu`. Commands:
+
+- `/status` — daemon + per-project state (with inline buttons)
+- `/account` — which Claude Code account the daemon is logged into (email, org, subscription)
+- `/usage` — Claude limit consumption in **percent** (current session + weekly), straight from `claude`'s own `/usage`; it's a local, free call that doesn't spend tokens
+- `/login` — re-authenticate the daemon's Claude account: the bot asks for confirmation (this changes billing/limits for every session), then sends the OAuth link; reply with the code from the browser and it completes the login (`/cancel` aborts). Login times out after 10 min.
+- `/pause <name>` · `/resume <name>` · `/priority <name> <n>` · `/logs <name>`
+
+Buttons per project: ⏸/▶️ toggle, 🔼/🔽 priority, 📜 logs. The account/usage/login features are thin wrappers over the `claude` CLI (`src/claudecli.rs`) — the daemon must have `claude` on PATH (it already does, since it runs the sessions).
 
 ## The `asana` CLI
 

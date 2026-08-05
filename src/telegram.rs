@@ -7,16 +7,30 @@
 //! Авторизация: только chat id из `telegram.allowed_chats` (~/.autopilot/config.yaml).
 //! Чужим бот отвечает их chat id — чтобы его можно было внести в конфиг.
 
+use crate::claudecli::{self, LoginProc};
 use crate::daemon::status_text;
 use crate::registry::{tg_offset_file, Registry, TelegramCfg};
 use crate::runner::{latest_session_log, tail_file};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Незавершённый флоу `/login`: процесс claude ждёт код от конкретного чата.
+struct PendingLogin {
+    chat_id: i64,
+    proc: LoginProc,
+    started: Instant,
+}
+
+/// Живёт не дольше этого — потом считаем брошенным и убиваем процесс claude.
+const LOGIN_TTL: Duration = Duration::from_secs(600);
 
 struct Bot {
     agent: ureq::Agent,
     base: String,
     cfg: TelegramCfg,
+    /// Ожидающий код авторизации логин (не больше одного за раз).
+    pending_login: Mutex<Option<PendingLogin>>,
 }
 
 pub fn spawn(cfg: TelegramCfg) -> Option<std::thread::JoinHandle<()>> {
@@ -28,7 +42,9 @@ pub fn spawn(cfg: TelegramCfg) -> Option<std::thread::JoinHandle<()>> {
                 .build(),
             base: format!("https://api.telegram.org/bot{token}"),
             cfg,
+            pending_login: Mutex::new(None),
         };
+        bot.register_commands();
         bot.poll_loop();
     }))
 }
@@ -144,25 +160,35 @@ impl Bot {
     }
 
     fn handle_command(&self, chat_id: i64, text: &str) {
+        // Если ждём код авторизации от этого чата — любой не-командный текст = код.
+        if !text.starts_with('/') {
+            if let Some(pending) = self.take_pending_login_for(chat_id) {
+                self.submit_login_code(chat_id, pending, text);
+                return;
+            }
+        }
+
         let mut parts = text.split_whitespace();
         let cmd = parts.next().unwrap_or("");
         // Команды вида /status@MyBot тоже принимаем.
         let cmd = cmd.split('@').next().unwrap_or(cmd);
         match cmd {
-            "/start" | "/help" => {
-                self.send(
-                    chat_id,
-                    "Автопилот. Команды:\n\
-                     /status — статус демона и проектов (с кнопками)\n\
-                     /logs <проект> — хвост последнего лога сессии\n\
-                     /pause <проект> | /resume <проект>\n\
-                     /priority <проект> <число>\n\
-                     Кнопки: ⏯ пауза/возобновление, 🔼/🔽 приоритет, 📜 логи.",
-                    None,
-                );
+            "/start" | "/help" | "/menu" => {
+                self.send(chat_id, &help_text(), Some(self.main_menu()));
             }
             "/status" => {
                 self.send(chat_id, &status_text(), Some(self.keyboard()));
+            }
+            "/whoami" | "/account" => self.send_account(chat_id),
+            "/usage" => self.send_usage(chat_id),
+            "/login" => self.send_login_confirm(chat_id),
+            "/cancel" => {
+                if let Some(p) = self.take_pending_login() {
+                    p.proc.abort();
+                    self.send(chat_id, "Вход отменён.", None);
+                } else {
+                    self.send(chat_id, "Отменять нечего.", None);
+                }
             }
             "/logs" => match parts.next() {
                 Some(name) => self.send_logs(chat_id, name),
@@ -204,6 +230,45 @@ impl Bot {
     }
 
     fn handle_callback(&self, cq_id: &str, chat_id: i64, message_id: i64, data: &str) {
+        // Кнопки главного меню и подтверждения логина (без разделителя '|').
+        match data {
+            "m_status" => {
+                self.answer_callback(cq_id, "Статус");
+                self.send(chat_id, &status_text(), Some(self.keyboard()));
+                return;
+            }
+            "m_account" => {
+                self.answer_callback(cq_id, "Аккаунт");
+                self.send_account(chat_id);
+                return;
+            }
+            "m_usage" => {
+                self.answer_callback(cq_id, "Usage…");
+                self.send_usage(chat_id);
+                return;
+            }
+            "m_login" => {
+                self.answer_callback(cq_id, "Вход");
+                self.send_login_confirm(chat_id);
+                return;
+            }
+            "login_go" => {
+                self.answer_callback(cq_id, "Запускаю…");
+                self.edit(chat_id, message_id, "🔐 Запускаю вход…", None);
+                self.start_login(chat_id);
+                return;
+            }
+            "login_cancel" => {
+                self.answer_callback(cq_id, "Отменено");
+                if let Some(p) = self.take_pending_login() {
+                    p.proc.abort();
+                }
+                self.edit(chat_id, message_id, "Вход отменён.", None);
+                return;
+            }
+            _ => {}
+        }
+
         let (op, name) = match data.split_once('|') {
             Some((o, n)) => (o, n),
             None => (data, ""),
@@ -260,6 +325,152 @@ impl Bot {
         }
     }
 
+    // ---- Аккаунт Claude / usage / логин ----
+
+    fn send_account(&self, chat_id: i64) {
+        match claudecli::auth_status() {
+            Ok(s) if s.logged_in => {
+                let text = format!(
+                    "👤 Аккаунт Claude Code\n\
+                     Email: {}\n\
+                     Организация: {}\n\
+                     Подписка: {}\n\
+                     Метод входа: {}",
+                    s.email.as_deref().unwrap_or("—"),
+                    s.org_name.as_deref().unwrap_or("—"),
+                    s.subscription.as_deref().unwrap_or("—"),
+                    s.auth_method.as_deref().unwrap_or("—"),
+                );
+                self.send(chat_id, &text, None);
+            }
+            Ok(_) => self.send(
+                chat_id,
+                "❌ Не залогинен. Нажми «🔐 Войти» или пришли /login.",
+                None,
+            ),
+            Err(e) => self.send(chat_id, &format!("Ошибка `claude auth status`: {e}"), None),
+        }
+    }
+
+    fn send_usage(&self, chat_id: i64) {
+        match claudecli::usage() {
+            Ok(mut text) => {
+                if text.chars().count() > 3800 {
+                    text = text.chars().take(3800).collect();
+                }
+                self.send(chat_id, &format!("📈 Лимиты Claude\n\n{text}"), None);
+            }
+            Err(e) => self.send(chat_id, &format!("Не удалось получить usage: {e}"), None),
+        }
+    }
+
+    fn send_login_confirm(&self, chat_id: i64) {
+        let kb = json!({"inline_keyboard": [[
+            {"text": "✅ Да, войти", "callback_data": "login_go"},
+            {"text": "Отмена", "callback_data": "login_cancel"},
+        ]]});
+        self.send(
+            chat_id,
+            "⚠️ Это перелогинит аккаунт Claude, которым работает демон \
+             (влияет на лимиты и биллинг всех сессий). Продолжить?",
+            Some(kb),
+        );
+    }
+
+    /// Стартует `claude auth login`, шлёт ссылку и ждёт код ответным сообщением.
+    fn start_login(&self, chat_id: i64) {
+        // Прерываем прежний незавершённый вход, если был.
+        if let Some(p) = self.take_pending_login() {
+            p.proc.abort();
+        }
+        match claudecli::login_start() {
+            Ok((proc, url)) => {
+                *self.pending_login.lock().unwrap() = Some(PendingLogin {
+                    chat_id,
+                    proc,
+                    started: Instant::now(),
+                });
+                self.send(
+                    chat_id,
+                    &format!(
+                        "🔗 Открой ссылку, авторизуйся и пришли мне код ответным сообщением \
+                         (или /cancel):\n\n{url}"
+                    ),
+                    None,
+                );
+            }
+            Err(e) => self.send(chat_id, &format!("Не удалось начать вход: {e}"), None),
+        }
+    }
+
+    fn submit_login_code(&self, chat_id: i64, pending: PendingLogin, code: &str) {
+        self.send(chat_id, "⏳ Проверяю код…", None);
+        match claudecli::login_finish(pending.proc, code) {
+            Ok(rest) => {
+                let acc = claudecli::auth_status()
+                    .ok()
+                    .filter(|s| s.logged_in)
+                    .and_then(|s| s.email)
+                    .map(|e| format!("\nТеперь залогинен как: {e}"))
+                    .unwrap_or_default();
+                let tail = if rest.is_empty() { String::new() } else { format!("\n\n{rest}") };
+                self.send(chat_id, &format!("✅ Вход выполнен.{acc}{tail}"), None);
+            }
+            Err(e) => self.send(chat_id, &format!("❌ Вход не удался: {e}"), None),
+        }
+    }
+
+    // ---- Состояние ожидающего логина ----
+
+    /// Забрать pending-login целиком (например, для /cancel), очистив слот.
+    fn take_pending_login(&self) -> Option<PendingLogin> {
+        self.pending_login.lock().unwrap().take()
+    }
+
+    /// Забрать pending-login, если он принадлежит этому чату и не протух.
+    /// Протухший убивается, свежий чужого чата остаётся на месте.
+    fn take_pending_login_for(&self, chat_id: i64) -> Option<PendingLogin> {
+        let mut guard = self.pending_login.lock().unwrap();
+        match guard.as_ref() {
+            Some(p) if p.started.elapsed() > LOGIN_TTL => {
+                guard.take().unwrap().proc.abort();
+                None
+            }
+            Some(p) if p.chat_id == chat_id => guard.take(),
+            _ => None,
+        }
+    }
+
+    /// Регистрирует список команд (кнопка «Menu» и автодополнение в Telegram).
+    fn register_commands(&self) {
+        let commands = json!([
+            {"command": "status", "description": "Статус демона и проектов"},
+            {"command": "menu", "description": "Главное меню"},
+            {"command": "account", "description": "Аккаунт Claude Code"},
+            {"command": "usage", "description": "Лимиты Claude (%)"},
+            {"command": "login", "description": "Войти в аккаунт Claude"},
+            {"command": "logs", "description": "Лог последней сессии проекта"},
+            {"command": "pause", "description": "Приостановить проект"},
+            {"command": "resume", "description": "Возобновить проект"},
+            {"command": "priority", "description": "Задать приоритет проекта"},
+        ]);
+        self.call("setMyCommands", json!({"commands": commands}));
+    }
+
+    /// Главное inline-меню (для /start, /menu, /help).
+    fn main_menu(&self) -> Value {
+        json!({"inline_keyboard": [
+            [
+                {"text": "📊 Статус", "callback_data": "m_status"},
+                {"text": "👤 Аккаунт", "callback_data": "m_account"},
+            ],
+            [
+                {"text": "📈 Usage", "callback_data": "m_usage"},
+                {"text": "🔐 Войти", "callback_data": "m_login"},
+            ],
+        ]})
+    }
+
     /// Inline-клавиатура: по строке на проект + строка «Обновить».
     fn keyboard(&self) -> Value {
         let reg = Registry::load().unwrap_or_default();
@@ -280,6 +491,20 @@ impl Bot {
         rows.push(json!([{"text": "🔄 Обновить", "callback_data": "r|"}]));
         json!({"inline_keyboard": rows})
     }
+}
+
+fn help_text() -> String {
+    "Автопилот — управление с телефона.\n\n\
+     Кнопки меню ниже или команды:\n\
+     /status — статус демона и проектов (с кнопками)\n\
+     /account — аккаунт Claude Code (кто залогинен, подписка)\n\
+     /usage — лимиты Claude в процентах\n\
+     /login — войти в аккаунт Claude (пришлёт ссылку)\n\
+     /logs <проект> — хвост последнего лога сессии\n\
+     /pause <проект> | /resume <проект>\n\
+     /priority <проект> <число>\n\
+     Кнопки проектов: ⏯ пауза, 🔼/🔽 приоритет, 📜 логи."
+        .to_string()
 }
 
 // ---- Операции над реестром (общие для команд и кнопок) ----
