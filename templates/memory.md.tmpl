@@ -12,7 +12,7 @@ metadata:
 **Файлы этого проекта:**
 - `autopilot/autopilot.yaml` — конфиг: workspace Asana, роли (operator/agent), маппинг секций по именам, approved-секции, эвристики. Токен НЕ в файле, а в env-переменной (`asana.token_env`).
 - `autopilot/prompt.md` — промпт claude-сессии (по-английски; комментарии в Asana — по-русски).
-- `autopilot/state/` — current-task.md, blocked.txt, done.log; `autopilot/logs/` — логи сессий.
+- `autopilot/state/` — current-task.md, done.log; `autopilot/logs/` — логи сессий.
 
 **CLI:** глобальные команды `autopilot` (add/remove/pause/resume/priority/status/logs/start/stop) и `asana` (task/comment/move/assign/complete/subtask/download/qa/done/block) — обе установлены через cargo install, `asana` находит конфиг проекта поиском вверх от cwd или через `AUTOPILOT_DIR`.
 

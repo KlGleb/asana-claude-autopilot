@@ -44,21 +44,6 @@ pub fn sleep_checking_stop(secs: u64) -> bool {
     stop_requested()
 }
 
-fn blocked_file(project: &ProjectEntry) -> PathBuf {
-    project.state_dir().join("blocked.txt")
-}
-
-fn read_blocked(project: &ProjectEntry) -> Vec<String> {
-    fs::read_to_string(blocked_file(project))
-        .map(|s| {
-            s.lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn append_line(path: &Path, line: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{line}");
@@ -91,7 +76,6 @@ fn was_manually_cleared(client: &Client, task_gid: &str) -> bool {
 /// Выбор задачи проекта (с побочными эффектами: возврат оператору задач из
 /// неправильных секций, авто-blocked по эвристике ручных действий).
 pub fn select_task(client: &Client, project: &ProjectEntry) -> Option<(Task, Placement)> {
-    let blocked = read_blocked(project);
     let today = Local::now().format("%Y-%m-%d").to_string();
     let settings = &client.settings;
 
@@ -105,7 +89,7 @@ pub fn select_task(client: &Client, project: &ProjectEntry) -> Option<(Task, Pla
 
     let mut runnable: Vec<(Task, Placement)> = Vec::new();
     for t in tasks {
-        if t.completed || blocked.contains(&t.gid) {
+        if t.completed {
             continue;
         }
         // Запрос уже фильтрует по assignee, но подстрахуемся.
@@ -201,7 +185,6 @@ pub fn select_task(client: &Client, project: &ProjectEntry) -> Option<(Task, Pla
                 let _ = client.add_comment(&task.gid, settings.msg_manual());
                 let _ = client.set_assignee(&task.gid, Some(&settings.operator_gid));
                 let _ = client.move_task_to_role(&task.gid, &placement.project_gid, "blocked");
-                append_line(&blocked_file(project), &task.gid);
                 continue;
             }
         }

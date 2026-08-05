@@ -85,6 +85,5 @@ Work per-repo — only where you actually changed files.
 ## Blocked Protocol
 Trigger this if the operator's intervention is required (access, decisions, payments) or the task/reopen reason is genuinely unclear.
 1. Commit and push everything as `WIP:` on the feature branch.
-2. `asana block <gid> - <<'EOF'` … `EOF` — comment (in Russian) with a clear list of required actions/questions; the command also reassigns to the operator and moves to blocked.
-3. Append the task GID to `autopilot/state/blocked.txt`.
-4. End the session.
+2. `asana block <gid> - <<'EOF'` … `EOF` — comment (in Russian) with a clear list of required actions/questions; the command also reassigns to the operator and moves to blocked. The blocked section in Asana is the single source of truth — no local bookkeeping needed.
+3. End the session.
