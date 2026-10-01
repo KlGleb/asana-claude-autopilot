@@ -1,0 +1,46 @@
+# Конфиг автопилота — проект {{PROJECT_NAME}} (трекер gleb_tasks).
+# Читается демоном `autopilot` и CLI `asana`/`tracker` (поиск вверх от cwd или AUTOPILOT_DIR).
+
+tracker: gleb_tasks
+
+gleb_tasks:
+  url: {{URL}}
+  # Имя переменной окружения с API-ключом workspace (Настройки workspace → API & MCP).
+  # Сам ключ в файле НЕ хранится — только имя переменной.
+  api_key_env: {{API_KEY_ENV}}
+  # Ключ workspace (префикс задач, напр. SAOBR). Ключ API привязан ровно к одному workspace.
+  workspace: "{{WORKSPACE}}"
+
+roles:
+  # Человек-оператор: сюда возвращаются задачи (blocked/qa/несоответствие секций).
+  # Можно указать `username` (Telegram-логин участника) либо `id` (uuid).
+  operator:
+    username: {{OPERATOR_USERNAME}}
+    label: {{OPERATOR_LABEL}}     # алиас для CLI: `asana assign <key> {{OPERATOR_LABEL}}`
+  # Аккаунт-агент: виртуальный участник «Claude Code» есть в каждом workspace,
+  # а действия по API-ключу и так идут от его имени — поля можно не менять.
+  agent:
+    username: {{AGENT_USERNAME}}
+    name: "{{AGENT_NAME}}"        # отображаемое имя — для детекции авторства комментариев
+    label: {{AGENT_LABEL}}        # алиас для CLI: `asana assign <key> {{AGENT_LABEL}}`
+
+# Роль -> имя секции на доске (резолв по имени, регистронезависимо).
+# Можно указать список синонимов на случай разных названий в разных проектах.
+sections:
+  todo:        ["todo", "To Do", "Бэклог", "Backlog"]
+  in_progress: ["in progress", "In Progress", "В работе"]
+  qa:          ["qa", "QA", "Тестирование"]
+  done:        ["done", "Done", "Готово"]
+  blocked:     ["blocked", "Blocked", "Заблокировано"]
+  reopen:      ["reopen", "Reopened", "Переоткрыто"]
+
+# Из каких ролей-секций автопилот берёт задачи в работу.
+approved: [todo, in_progress, reopen]
+
+heuristics:
+  # Слова в описании, при которых задача сразу уходит в blocked (нужен человек).
+  manual_keywords: [доступы, оплата, аккаунт, физические устройства, access, payment, account]
+  # Язык комментариев автопилота: ru | en
+  comment_language: ru
+
+prompt_file: prompt.md

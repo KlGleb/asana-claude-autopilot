@@ -206,7 +206,7 @@ fn extract_model_and_effort(text: &str) -> (String, String) {
         .captures(text)
         .map(|c| c[1].to_lowercase())
         .or_else(|| free.as_ref().map(|c| c[1].to_lowercase()))
-        .unwrap_or_else(|| "opus".into());
+        .unwrap_or_else(|| "fable".into());
     let effort = effort_re
         .captures(text)
         .map(|c| c[1].to_lowercase())

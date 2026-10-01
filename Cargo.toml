@@ -26,6 +26,11 @@ path = "src/bin/autopilot.rs"
 name = "asana"
 path = "src/bin/asana.rs"
 
+# Тот же бинарь под трекер-нейтральным именем (для проектов на gleb_tasks).
+[[bin]]
+name = "tracker"
+path = "src/bin/tracker.rs"
+
 [profile.release]
 strip = true
 lto = true

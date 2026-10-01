@@ -6,13 +6,14 @@
 //!    заполнил в prompt.md реальную структуру репозиториев и git-процесс.
 
 use crate::registry::{home_dir, GlobalConfig, ProjectEntry};
-use crate::{ApiError, Result};
+use crate::{ApiError, Result, Tracker};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const YAML_TMPL: &str = include_str!("../templates/autopilot.yaml.tmpl");
+const YAML_GLEB_TASKS_TMPL: &str = include_str!("../templates/autopilot.gleb_tasks.yaml.tmpl");
 const PROMPT_TMPL: &str = include_str!("../templates/prompt.md.tmpl");
 const MEMORY_TMPL: &str = include_str!("../templates/memory.md.tmpl");
 const INIT_PROMPT_TMPL: &str = include_str!("../templates/init-prompt.md.tmpl");
@@ -47,6 +48,7 @@ pub fn ensure_files(
     project: &ProjectEntry,
     gcfg: &GlobalConfig,
     workspace: Option<&str>,
+    tracker: Tracker,
 ) -> Result<bool> {
     let apdir = project.autopilot_dir();
     fs::create_dir_all(project.logs_dir())
@@ -73,24 +75,64 @@ pub fn ensure_files(
 
     let yaml_path = apdir.join("autopilot.yaml");
     if !yaml_path.exists() {
-        let yaml = fill(
-            YAML_TMPL,
-            &[
-                ("PROJECT_NAME", project.name.as_str()),
-                ("TOKEN_ENV", d.token_env.as_str()),
-                ("WORKSPACE", workspace.unwrap_or("FILL_ME")),
-                ("OPERATOR_GID", op_gid.as_str()),
-                ("OPERATOR_LABEL", op_label.as_str()),
-                ("AGENT_GID", ag_gid.as_str()),
-                ("AGENT_NAME", ag_name.as_str()),
-                ("AGENT_LABEL", ag_label.as_str()),
-            ],
-        );
+        let yaml = match tracker {
+            Tracker::Asana => fill(
+                YAML_TMPL,
+                &[
+                    ("PROJECT_NAME", project.name.as_str()),
+                    ("TOKEN_ENV", d.token_env.as_str()),
+                    ("WORKSPACE", workspace.unwrap_or("FILL_ME")),
+                    ("OPERATOR_GID", op_gid.as_str()),
+                    ("OPERATOR_LABEL", op_label.as_str()),
+                    ("AGENT_GID", ag_gid.as_str()),
+                    ("AGENT_NAME", ag_name.as_str()),
+                    ("AGENT_LABEL", ag_label.as_str()),
+                ],
+            ),
+            Tracker::GlebTasks => {
+                let g = d.gleb_tasks.clone().unwrap_or(crate::registry::GlebTasksDefaults {
+                    url: "https://tasks.gleb.at".into(),
+                    api_key_env: "GLEB_TASKS_API_KEY".into(),
+                    operator: None,
+                    agent: None,
+                });
+                let (op_user, op_label) = g
+                    .operator
+                    .as_ref()
+                    .map(|o| (o.username.clone(), if o.label.is_empty() { "operator".into() } else { o.label.clone() }))
+                    .unwrap_or(("FILL_ME".into(), "operator".into()));
+                let (ag_user, ag_name, ag_label) = g
+                    .agent
+                    .as_ref()
+                    .map(|a| {
+                        (
+                            if a.username.is_empty() { "claude".into() } else { a.username.clone() },
+                            if a.name.is_empty() { "Claude Code".into() } else { a.name.clone() },
+                            if a.label.is_empty() { "agent".into() } else { a.label.clone() },
+                        )
+                    })
+                    .unwrap_or(("claude".into(), "Claude Code".into(), "agent".into()));
+                fill(
+                    YAML_GLEB_TASKS_TMPL,
+                    &[
+                        ("PROJECT_NAME", project.name.as_str()),
+                        ("URL", g.url.as_str()),
+                        ("API_KEY_ENV", g.api_key_env.as_str()),
+                        ("WORKSPACE", workspace.unwrap_or("FILL_ME")),
+                        ("OPERATOR_USERNAME", op_user.as_str()),
+                        ("OPERATOR_LABEL", op_label.as_str()),
+                        ("AGENT_USERNAME", ag_user.as_str()),
+                        ("AGENT_NAME", ag_name.as_str()),
+                        ("AGENT_LABEL", ag_label.as_str()),
+                    ],
+                )
+            }
+        };
         fs::write(&yaml_path, yaml)
             .map_err(|e| ApiError(format!("write {}: {e}", yaml_path.display())))?;
-        println!("  создан {}", yaml_path.display());
+        println!("  создан {} (tracker: {})", yaml_path.display(), tracker.name());
         if workspace.is_none() {
-            println!("  ⚠️ workspace не задан — впиши gid workspace в autopilot.yaml (или используй --workspace)");
+            println!("  ⚠️ workspace не задан — впиши его в autopilot.yaml (или используй --workspace)");
         }
     } else {
         println!("  {} уже существует — не трогаю", yaml_path.display());
@@ -139,7 +181,7 @@ pub fn write_memory(project: &ProjectEntry) -> Result<()> {
             index.push('\n');
         }
         index.push_str(
-            "- [Asana autopilot](asana-autopilot.md) — проект под контролем глобального демона autopilot; конфиг в ./autopilot/, CLI `asana`\n",
+            "- [Asana autopilot](asana-autopilot.md) — проект под контролем глобального демона autopilot (Asana или gleb_tasks); конфиг в ./autopilot/, CLI `asana`/`tracker`\n",
         );
         fs::write(&index_path, index)
             .map_err(|e| ApiError(format!("write {}: {e}", index_path.display())))?;

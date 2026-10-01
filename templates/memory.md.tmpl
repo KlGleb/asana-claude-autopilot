@@ -7,13 +7,13 @@ metadata:
 
 Этот проект ({{PROJECT_NAME}}, {{PROJECT_DIR}}) контролируется автопилотом **asana-claude-autopilot** (исходники: /Users/glebklimov/Documents/2026/asana-claude-autopilot, github.com/KlGleb/asana-claude-autopilot).
 
-**Как это работает:** один глобальный демон (`autopilot start/stop/status`, состояние в `~/.autopilot/`) обходит зарегистрированные проекты по приоритету, берёт в Asana задачи, назначенные на аккаунт-агента «Claude Code», и на каждую запускает одну сессию `claude -p` в каталоге проекта. Управление также через Telegram-бота (пауза/возобновление, приоритеты, логи).
+**Как это работает:** один глобальный демон (`autopilot start/stop/status`, состояние в `~/.autopilot/`) обходит зарегистрированные проекты по приоритету, берёт в трекере (Asana или gleb_tasks — по `tracker:` в конфиге) задачи, назначенные на аккаунт-агента «Claude Code», и на каждую запускает одну сессию `claude -p` в каталоге проекта. Управление также через Telegram-бота (пауза/возобновление, приоритеты, логи).
 
 **Файлы этого проекта:**
-- `autopilot/autopilot.yaml` — конфиг: workspace Asana, роли (operator/agent), маппинг секций по именам, approved-секции, эвристики. Токен НЕ в файле, а в env-переменной (`asana.token_env`).
+- `autopilot/autopilot.yaml` — конфиг: трекер (`tracker: asana|gleb_tasks`), workspace, роли (operator/agent), маппинг секций по именам, approved-секции, эвристики. Токен НЕ в файле, а в env-переменной (`asana.token_env` / `gleb_tasks.api_key_env`).
 - `autopilot/prompt.md` — промпт claude-сессии (по-английски; комментарии в Asana — по-русски).
 - `autopilot/state/` — current-task.md, done.log; `autopilot/logs/` — логи сессий.
 
-**CLI:** глобальные команды `autopilot` (add/remove/pause/resume/priority/status/logs/start/stop) и `asana` (task/comment/move/assign/complete/subtask/download/qa/done/block) — обе установлены через cargo install, `asana` находит конфиг проекта поиском вверх от cwd или через `AUTOPILOT_DIR`.
+**CLI:** глобальные команды `autopilot` (add/remove/pause/resume/priority/status/logs/start/stop) и `asana` (алиас `tracker`; task/comment/move/assign/complete/subtask/download/qa/done/block) — установлены через cargo install, `asana` находит конфиг проекта поиском вверх от cwd или через `AUTOPILOT_DIR` и работает с тем трекером, что указан в конфиге.
 
 **Процесс задач:** todo/in_progress/reopen → берётся в работу; результат → qa (с сабтаской тестирования) или done; вопросы → blocked + реассайн на оператора. Задачи из чужих секций и досок без нужных секций возвращаются оператору с комментарием.

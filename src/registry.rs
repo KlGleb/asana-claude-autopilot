@@ -147,6 +147,9 @@ pub struct DefaultsCfg {
     pub token_env: String,
     pub operator: Option<PersonCfg>,
     pub agent: Option<AgentCfg>,
+    /// Дефолты для проектов на трекере gleb_tasks (`autopilot add --tracker gleb_tasks`).
+    #[serde(default)]
+    pub gleb_tasks: Option<GlebTasksDefaults>,
 }
 
 impl Default for DefaultsCfg {
@@ -155,8 +158,44 @@ impl Default for DefaultsCfg {
             token_env: d_token_env(),
             operator: None,
             agent: None,
+            gleb_tasks: None,
         }
     }
+}
+
+/// Дефолты трекера gleb_tasks: адрес, имя env-переменной с API-ключом, роли по username.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GlebTasksDefaults {
+    #[serde(default = "d_gleb_tasks_url")]
+    pub url: String,
+    #[serde(default = "d_gleb_tasks_key_env")]
+    pub api_key_env: String,
+    pub operator: Option<UserNameCfg>,
+    pub agent: Option<AgentNameCfg>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserNameCfg {
+    pub username: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentNameCfg {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+fn d_gleb_tasks_url() -> String {
+    "https://tasks.gleb.at".into()
+}
+fn d_gleb_tasks_key_env() -> String {
+    "GLEB_TASKS_API_KEY".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
