@@ -61,7 +61,7 @@ defaults:                # used by `autopilot add` to fill new project configs
 
 daemon:
   session_timeout: 10800  # hard kill for a session, seconds
-  no_task_sleep: 600      # sleep when no project has tasks
+  no_task_sleep: 60       # poll interval when no project has tasks = max pickup delay for a new task
   limit_sleep: 1200       # sleep when usage limits are hit on the fallback model too
   fallback_model: opus
 

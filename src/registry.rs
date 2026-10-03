@@ -221,7 +221,8 @@ pub struct DaemonCfg {
     /// Сон после упирания в лимит на fallback-модели, сек.
     #[serde(default = "d_limit_sleep")]
     pub limit_sleep: u64,
-    /// Сон, когда ни в одном проекте нет задач, сек.
+    /// Пауза между опросами трекеров, когда ни в одном проекте нет задач, сек.
+    /// Это и есть максимальная задержка взятия новой задачи в работу.
     #[serde(default = "d_no_task_sleep")]
     pub no_task_sleep: u64,
     #[serde(default = "d_fallback_model")]
@@ -284,7 +285,7 @@ fn d_limit_sleep() -> u64 {
     1200
 }
 fn d_no_task_sleep() -> u64 {
-    600
+    60
 }
 fn d_fallback_model() -> String {
     "opus".into()
