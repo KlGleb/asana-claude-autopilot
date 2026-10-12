@@ -193,23 +193,33 @@ pub fn select_task(client: &Client, project: &ProjectEntry) -> Option<(Task, Pla
     None
 }
 
-fn extract_model_and_effort(text: &str) -> (String, String) {
+/// Модель и эффорт сессии. Источники по убыванию приоритета: custom fields
+/// задачи (имена из `fields:` в autopilot.yaml, по умолчанию «Model»/«Effort»,
+/// TASKS-11) → директивы в тексте («model: sonnet», «effort: high», «Sonnet,
+/// medium effort») → значения по умолчанию (fable, эффорт не задан = «-»).
+fn extract_model_and_effort(settings: &crate::Settings, task: &Task, text: &str) -> (String, String) {
     let re = |p: &str| RegexBuilder::new(p).case_insensitive(true).build().unwrap();
-    // Директивы «модель: sonnet» / «model: sonnet», «эффорт: medium» / «effort: medium»
-    // и свободная форма «Sonnet, medium effort».
     let model_re = re(r"(?:модель|model):\s*(opus|sonnet|haiku|fable)");
-    let effort_re = re(r"(?:эффорт|effort):\s*(low|medium|high)");
-    let free_re = re(r"\b(opus|sonnet|haiku|fable)\b[\s,]+(low|medium|high)\s+effort");
+    let effort_re = re(r"(?:эффорт|effort):\s*(low|medium|high|xhigh|max)");
+    let free_re = re(r"\b(opus|sonnet|haiku|fable)\b[\s,]+(low|medium|high|xhigh|max)\s+effort");
+
+    let from_field = |name: &str, allowed: &[&str]| -> Option<String> {
+        let v = task.field(name)?.trim().to_lowercase();
+        if allowed.contains(&v.as_str()) {
+            Some(v)
+        } else {
+            log(&format!("Поле «{name}» = «{v}» не входит в {} — игнорирую", allowed.join("/")));
+            None
+        }
+    };
 
     let free = free_re.captures(text);
-    let model = model_re
-        .captures(text)
-        .map(|c| c[1].to_lowercase())
+    let model = from_field(&settings.model_field, crate::MODEL_OPTIONS)
+        .or_else(|| model_re.captures(text).map(|c| c[1].to_lowercase()))
         .or_else(|| free.as_ref().map(|c| c[1].to_lowercase()))
         .unwrap_or_else(|| "fable".into());
-    let effort = effort_re
-        .captures(text)
-        .map(|c| c[1].to_lowercase())
+    let effort = from_field(&settings.effort_field, crate::EFFORT_OPTIONS)
+        .or_else(|| effort_re.captures(text).map(|c| c[1].to_lowercase()))
         .or_else(|| free.as_ref().map(|c| c[2].to_lowercase()))
         .unwrap_or_else(|| "-".into());
     (model, effort)
@@ -247,7 +257,7 @@ pub fn run_session(
         return Outcome::Error;
     }
 
-    let (mut model, effort) = extract_model_and_effort(&context);
+    let (mut model, effort) = extract_model_and_effort(&client.settings, &full_task, &context);
     if let Some(m) = model_override {
         model = m.to_string();
     }
@@ -295,17 +305,9 @@ pub fn run_session(
     if model != gcfg.daemon.fallback_model {
         cmd.arg("--fallback-model").arg(&gcfg.daemon.fallback_model);
     }
-    match effort.as_str() {
-        "low" => {
-            cmd.env("MAX_THINKING_TOKENS", "2048");
-        }
-        "medium" => {
-            cmd.env("MAX_THINKING_TOKENS", "10000");
-        }
-        "high" => {
-            cmd.env("MAX_THINKING_TOKENS", "31999");
-        }
-        _ => {}
+    // Эффорт — штатный флаг claude CLI (low/medium/high/xhigh/max); без него — дефолт CLI.
+    if crate::EFFORT_OPTIONS.contains(&effort.as_str()) {
+        cmd.arg("--effort").arg(&effort);
     }
     cmd.stdout(log_file.try_clone().unwrap()).stderr(log_file);
 
@@ -408,4 +410,71 @@ pub fn tail_file(path: &Path, n: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FieldValue, Settings, Tracker};
+
+    fn settings() -> Settings {
+        Settings {
+            tracker: Tracker::GlebTasks,
+            token: String::new(),
+            base_url: String::new(),
+            workspace: String::new(),
+            workspace_key: "TASKS".into(),
+            operator_gid: String::new(),
+            operator_label: "gleb".into(),
+            agent_gid: String::new(),
+            agent_name: "Claude Code".into(),
+            agent_label: "claude".into(),
+            sections: Vec::new(),
+            approved: Vec::new(),
+            manual_keywords: Vec::new(),
+            comment_language: "ru".into(),
+            prompt_file: "prompt.md".into(),
+            mismatch_comment: None,
+            model_field: "Model".into(),
+            effort_field: "Effort".into(),
+        }
+    }
+
+    fn task_with(fields: &[(&str, &str)]) -> Task {
+        Task {
+            custom_fields: fields
+                .iter()
+                .map(|(n, v)| FieldValue { name: n.to_string(), value: v.to_string(), ..Default::default() })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn defaults_when_nothing_is_set() {
+        assert_eq!(extract_model_and_effort(&settings(), &task_with(&[]), "просто текст"), ("fable".into(), "-".into()));
+    }
+
+    #[test]
+    fn fields_win_over_text_directives() {
+        let task = task_with(&[("model", "Sonnet"), ("EFFORT", "xhigh")]);
+        let (m, e) = extract_model_and_effort(&settings(), &task, "model: opus\neffort: low");
+        assert_eq!((m.as_str(), e.as_str()), ("sonnet", "xhigh"));
+    }
+
+    #[test]
+    fn text_directives_fill_what_fields_leave_empty() {
+        let task = task_with(&[("Effort", "max")]);
+        let (m, e) = extract_model_and_effort(&settings(), &task, "модель: haiku");
+        assert_eq!((m.as_str(), e.as_str()), ("haiku", "max"));
+        let (m, e) = extract_model_and_effort(&settings(), &task_with(&[]), "Sonnet, medium effort");
+        assert_eq!((m.as_str(), e.as_str()), ("sonnet", "medium"));
+    }
+
+    #[test]
+    fn unknown_field_values_are_ignored() {
+        let task = task_with(&[("Model", "gpt"), ("Effort", "ultra")]);
+        let (m, e) = extract_model_and_effort(&settings(), &task, "effort: high");
+        assert_eq!((m.as_str(), e.as_str()), ("fable", "high"));
+    }
 }

@@ -43,4 +43,11 @@ heuristics:
   # Язык комментариев автопилота: ru | en
   comment_language: ru
 
+# Custom fields задачи, из которых демон берёт модель и эффорт сессии
+# (SELECT-поля для исполнителя Claude Code; создаются командой `asana fields`).
+# Пустое поле — значения по умолчанию (модель fable, эффорт — дефолт claude CLI).
+fields:
+  model: Model
+  effort: Effort
+
 prompt_file: prompt.md

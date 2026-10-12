@@ -34,6 +34,10 @@ const USAGE: &str = r#"asana — лёгкая CLI трекера задач: Asa
   asana qa <gid> <comment|->           Комментарий + перенос в qa + assign оператору.
   asana done <gid> <comment|->         Комментарий + перенос в done + assign оператору.
   asana block <gid> <comment|->        Комментарий + assign оператору + перенос в blocked.
+  asana fields                         (gleb_tasks) Создать в workspace поля «Model» и «Effort»
+                                       (SELECT, для исполнителя Claude Code, необязательные) —
+                                       из них демон берёт модель и эффорт сессии. Имена полей
+                                       настраиваются в autopilot.yaml: fields: {model, effort}.
 
 Токен: env-переменная из autopilot.yaml (asana.token_env, по умолчанию ASANA_ACCESS_TOKEN;
 для gleb_tasks — gleb_tasks.api_key_env, по умолчанию GLEB_TASKS_API_KEY).
@@ -186,6 +190,14 @@ fn main() {
                 client.set_assignee(gid, Some(&s.operator_gid))?;
                 client.move_task_to_role(gid, &proj, "blocked")?;
                 println!("OK: {gid} → blocked, assignee оператор, комментарий добавлен");
+            }
+            "fields" => {
+                for line in client.ensure_session_fields()? {
+                    println!("OK: {line}");
+                }
+                println!(
+                    "Пустое поле = значения по умолчанию (модель fable, эффорт — дефолт claude CLI)."
+                );
             }
             _ => {
                 eprintln!("Unknown command: {cmd}\n");

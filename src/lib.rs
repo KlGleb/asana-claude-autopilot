@@ -88,6 +88,26 @@ struct RawSettings {
     prompt_file: String,
     #[serde(default)]
     mismatch_comment: Option<String>,
+    /// Имена custom fields задачи, из которых берутся модель и эффорт сессии (gleb_tasks).
+    #[serde(default)]
+    fields: RawFields,
+}
+
+/// Custom fields задачи с параметрами сессии (TASKS-11). Поля SELECT, привязанные
+/// к агенту: значение опции = алиас модели (fable/opus/sonnet/haiku) или уровень
+/// эффорта (low/medium/high/xhigh/max). Пусто → значения по умолчанию демона.
+#[derive(Debug, Deserialize)]
+struct RawFields {
+    #[serde(default = "default_model_field")]
+    model: String,
+    #[serde(default = "default_effort_field")]
+    effort: String,
+}
+
+impl Default for RawFields {
+    fn default() -> Self {
+        RawFields { model: default_model_field(), effort: default_effort_field() }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +200,17 @@ fn default_language() -> String {
 fn default_prompt_file() -> String {
     "prompt.md".into()
 }
+fn default_model_field() -> String {
+    "Model".into()
+}
+fn default_effort_field() -> String {
+    "Effort".into()
+}
+
+/// Допустимые значения поля модели (алиасы claude CLI).
+pub const MODEL_OPTIONS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
+/// Допустимые значения поля эффорта (`claude --effort`).
+pub const EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// Обработанный конфиг автопилота одного проекта.
 ///
@@ -206,6 +237,10 @@ pub struct Settings {
     pub comment_language: String,
     pub prompt_file: String,
     mismatch_comment: Option<String>,
+    /// Имя custom field задачи с моделью сессии (по умолчанию «Model»).
+    pub model_field: String,
+    /// Имя custom field задачи с эффортом сессии (по умолчанию «Effort»).
+    pub effort_field: String,
 }
 
 impl Settings {
@@ -281,6 +316,8 @@ impl Settings {
             comment_language: rs.heuristics.comment_language.clone(),
             prompt_file: rs.prompt_file.clone(),
             mismatch_comment: rs.mismatch_comment.clone(),
+            model_field: rs.fields.model.trim().to_string(),
+            effort_field: rs.fields.effort.trim().to_string(),
         };
 
         match tracker {
@@ -477,9 +514,36 @@ pub struct Task {
     pub parent: Option<Ref>,
     #[serde(default)]
     pub memberships: Vec<Membership>,
+    /// Значения custom fields задачи (gleb_tasks; у Asana пусто).
+    #[serde(default)]
+    pub custom_fields: Vec<FieldValue>,
+}
+
+/// Значение custom field задачи в человекочитаемом виде (SELECT — имя опции,
+/// CHECKBOX — да/нет, остальное — как есть). Пустые значения не включаются.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct FieldValue {
+    pub field_id: String,
+    pub name: String,
+    pub kind: String,
+    pub value: String,
+    /// Поле привязано к исполнителям (персональное), а не глобальное.
+    #[serde(default)]
+    pub scoped: bool,
 }
 
 impl Task {
+    /// Значение custom field по имени (без учёта регистра), если оно заполнено.
+    pub fn field(&self, name: &str) -> Option<&str> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        self.custom_fields
+            .iter()
+            .find(|f| f.name.trim().eq_ignore_ascii_case(name) && !f.value.is_empty())
+            .map(|f| f.value.as_str())
+    }
     pub fn assignee_gid(&self) -> Option<&str> {
         self.assignee.as_ref().map(|a| a.gid.as_str())
     }
@@ -691,6 +755,22 @@ impl Client {
     // ---- Секции проекта (резолв роли -> gid по имени) ----
 
     /// Список секций проекта (кэшируется на время жизни клиента).
+    /// Создаёт в workspace custom fields с параметрами сессии (`fields:` в конфиге:
+    /// «Model» и «Effort», SELECT, для исполнителя-агента, необязательные). Только gleb_tasks.
+    pub fn ensure_session_fields(&self) -> Result<Vec<String>> {
+        match &self.backend {
+            Backend::Asana(_) => Err(ApiError(
+                "custom fields модели/эффорта поддерживаются только для tracker gleb_tasks; \
+                 в Asana используй директивы «model: …» / «effort: …» в описании"
+                    .into(),
+            )),
+            Backend::GlebTasks(g) => Ok(vec![
+                g.ensure_select_field(&self.settings.model_field, MODEL_OPTIONS)?,
+                g.ensure_select_field(&self.settings.effort_field, EFFORT_OPTIONS)?,
+            ]),
+        }
+    }
+
     pub fn project_sections(&self, project_gid: &str) -> Result<Vec<Ref>> {
         if let Some(s) = self.section_cache.lock().unwrap().get(project_gid) {
             return Ok(s.clone());
@@ -829,6 +909,14 @@ impl Client {
         out.push_str("\n## Описание\n");
         out.push_str(if task.notes.is_empty() { "Нет описания" } else { &task.notes });
         out.push('\n');
+
+        // --- Custom fields (только заполненные) ---
+        if !task.custom_fields.is_empty() {
+            out.push_str("\n## Поля\n");
+            for f in &task.custom_fields {
+                out.push_str(&format!("- **{}:** {}\n", f.name, f.value));
+            }
+        }
 
         // --- Сабтаски ---
         out.push_str("\n## Сабтаски\n");
