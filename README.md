@@ -127,11 +127,20 @@ asana complete <gid>
 asana subtask <parent> <name> [--notes <text|->] [--assignee operator|agent]
 asana download <attachment_gid> [dir]
 asana qa|done|block <gid> <comment|->   # comment + move + reassign in one call
+asana fields              # gleb_tasks: create the Model / Effort custom fields in the workspace
 ```
 
 ## Model & effort per task
 
-Put a directive in the Asana task description (Russian or English): `model: sonnet`, `effort: medium` (low ≈ 2k thinking tokens, medium ≈ 10k, high ≈ 32k). Default model is `fable` with automatic fallback to `opus` when usage limits are hit.
+For a **gleb_tasks** project the task carries two custom fields, **Model** (`fable` / `opus` / `sonnet` / `haiku`) and **Effort** (`low` / `medium` / `high` / `xhigh` / `max`). Both are SELECT fields scoped to the Claude Code member — they show up in the "Fields for Claude Code" dialog when you hand a task over, and in the task card while it is assigned to the agent. Leave them empty for the defaults (model `fable`, the `claude` CLI's default effort). Create them once per workspace with `asana fields` (idempotent; run from the project directory or with `AUTOPILOT_DIR`); the names are configurable in `autopilot.yaml`:
+
+```yaml
+fields:
+  model: Model
+  effort: Effort
+```
+
+Text directives still work for both trackers (and are the only option for Asana): `model: sonnet`, `effort: medium` in the task description, Russian or English. Fields win over text. Effort is passed as `claude --effort <level>`; the default model has automatic fallback to `opus` when usage limits are hit.
 
 ## Safety notes
 

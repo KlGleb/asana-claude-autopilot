@@ -3,7 +3,7 @@
 //! uuid, «человеческий» id — ключ вида `SAOBR-12` (принимается везде, где
 //! ожидается id). Вложения адресуются как `<задача>/<uuid вложения>`.
 
-use crate::{ApiError, Attachment, Membership, Ref, Result, Story, Task, User};
+use crate::{ApiError, Attachment, FieldValue, Membership, Ref, Result, Story, Task, User};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,7 +11,8 @@ use std::time::Duration;
 /// Поля задачи, общие для всех запросов.
 const TASK_FIELDS: &str = "id key title description completed dueDate \
     assignee { id displayName username } parent { id key } \
-    projects { project { id name } section { id name } }";
+    projects { project { id name } section { id name } } \
+    customFields { field { id name kind options { id name } assignees { id } } value }";
 
 pub struct GlebTasksApi {
     agent: ureq::Agent,
@@ -157,6 +158,49 @@ impl GlebTasksApi {
         })
     }
 
+    /// Значение custom field → текст: SELECT/MULTI_SELECT — имена опций,
+    /// CHECKBOX — да/нет, остальное — как есть. None, если значение пустое.
+    fn field_value_of(cf: &Value) -> Option<FieldValue> {
+        let field = &cf["field"];
+        let value = &cf["value"];
+        if value.is_null() {
+            return None;
+        }
+        let kind = field["kind"].as_str().unwrap_or_default();
+        let option_name = |id: &str| -> String {
+            field["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|o| o["id"].as_str() == Some(id))
+                .and_then(|o| o["name"].as_str())
+                .unwrap_or(id)
+                .to_string()
+        };
+        let text = match (kind, value) {
+            ("SELECT", Value::String(id)) => option_name(id),
+            ("MULTI_SELECT", Value::Array(ids)) => ids
+                .iter()
+                .filter_map(Value::as_str)
+                .map(option_name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            ("CHECKBOX", Value::Bool(b)) => (if *b { "да" } else { "нет" }).to_string(),
+            (_, Value::String(x)) => x.trim().to_string(),
+            (_, other) => other.to_string(),
+        };
+        if text.is_empty() {
+            return None;
+        }
+        Some(FieldValue {
+            field_id: field["id"].as_str().unwrap_or_default().to_string(),
+            name: field["name"].as_str().unwrap_or_default().to_string(),
+            kind: kind.to_string(),
+            value: text,
+            scoped: field["assignees"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        })
+    }
+
     fn task_of(&self, v: &Value) -> Task {
         let key = v["key"].as_str().map(str::to_string);
         Task {
@@ -186,6 +230,12 @@ impl GlebTasksApi {
                         name: l["section"]["name"].as_str().unwrap_or_default().to_string(),
                     }),
                 })
+                .collect(),
+            custom_fields: v["customFields"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Self::field_value_of)
                 .collect(),
         }
     }
@@ -369,6 +419,73 @@ impl GlebTasksApi {
             .or(v["createTask"]["id"].as_str())
             .unwrap_or_default()
             .to_string())
+    }
+
+    /// Создаёт (или дополняет опциями) SELECT-поле `name`, привязанное к агенту,
+    /// необязательное. Возвращает строку-отчёт для CLI.
+    pub fn ensure_select_field(&self, name: &str, options: &[&str]) -> Result<String> {
+        let v = self.gql(
+            "query($w: ID!) { workspace(id: $w) { customFields { id name kind options { id name } assignees { id } } } }",
+            json!({ "w": self.workspace_id }),
+        )?;
+        let existing = v["workspace"]["customFields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|f| f["name"].as_str().map(|n| n.trim().eq_ignore_ascii_case(name)).unwrap_or(false))
+            .cloned();
+        let Some(f) = existing else {
+            let opts: Vec<Value> = options.iter().map(|o| json!({ "name": o })).collect();
+            let r = self.gql(
+                "mutation($w: ID!, $n: String!, $o: [CustomFieldOptionInput!], $a: [ID!]) { \
+                    createCustomField(workspaceId: $w, name: $n, kind: SELECT, options: $o, assigneeIds: $a, required: false) { id } }",
+                json!({ "w": self.workspace_id, "n": name, "o": opts, "a": [self.agent_id] }),
+            )?;
+            return Ok(format!(
+                "создано поле «{name}» (SELECT: {}; для исполнителя-агента) id {}",
+                options.join("/"),
+                r["createCustomField"]["id"].as_str().unwrap_or_default()
+            ));
+        };
+        let id = f["id"].as_str().unwrap_or_default().to_string();
+        if f["kind"].as_str() != Some("SELECT") {
+            return Err(ApiError(format!(
+                "поле «{name}» уже есть, но его тип {} — нужен SELECT; переименуй его или укажи другое имя в autopilot.yaml (fields:)",
+                f["kind"].as_str().unwrap_or("?")
+            )));
+        }
+        let have: Vec<Value> = f["options"].as_array().cloned().unwrap_or_default();
+        let missing: Vec<&str> = options
+            .iter()
+            .copied()
+            .filter(|o| !have.iter().any(|h| h["name"].as_str().map(|n| n.eq_ignore_ascii_case(o)).unwrap_or(false)))
+            .collect();
+        let has_agent = f["assignees"]
+            .as_array()
+            .map(|a| a.iter().any(|u| u["id"].as_str() == Some(self.agent_id.as_str())))
+            .unwrap_or(false);
+        if missing.is_empty() && has_agent {
+            return Ok(format!("поле «{name}» уже настроено (id {id})"));
+        }
+        let mut opts: Vec<Value> = have.iter().map(|h| json!({ "id": h["id"], "name": h["name"] })).collect();
+        opts.extend(missing.iter().map(|o| json!({ "name": o })));
+        let mut assignees: Vec<Value> = f["assignees"].as_array().cloned().unwrap_or_default().iter().map(|u| u["id"].clone()).collect();
+        if !has_agent {
+            assignees.push(json!(self.agent_id));
+        }
+        self.gql(
+            "mutation($id: ID!, $o: [CustomFieldOptionInput!], $a: [ID!]) { \
+                updateCustomField(id: $id, options: $o, assigneeIds: $a) { id } }",
+            json!({ "id": id, "o": opts, "a": assignees }),
+        )?;
+        let mut what = Vec::new();
+        if !missing.is_empty() {
+            what.push(format!("добавлены опции {}", missing.join("/")));
+        }
+        if !has_agent {
+            what.push("привязано к исполнителю-агенту".to_string());
+        }
+        Ok(format!("поле «{name}» обновлено: {} (id {id})", what.join(", ")))
     }
 
     pub fn project_sections(&self, project_id: &str) -> Result<Vec<Ref>> {
