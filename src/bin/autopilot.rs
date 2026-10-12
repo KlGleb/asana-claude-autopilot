@@ -16,7 +16,7 @@ use std::process::{exit, Command, Stdio};
 const USAGE: &str = r#"autopilot — демон, раздающий Asana-задачи Claude Code по всем вашим проектам
 
 ПРОЕКТЫ:
-  autopilot add <dir> [--name N] [--priority P] [--workspace GID] [--no-init]
+  autopilot add <dir> [--name N] [--priority P] [--workspace GID|KEY] [--tracker asana|gleb_tasks] [--no-init]
                                 Добавить проект под контроль (создаёт <dir>/autopilot/
                                 с конфигом и промптом; --no-init = без доводки промпта
                                 через claude). Повторный add обновляет запись.
@@ -78,6 +78,7 @@ fn cmd_add(args: &[String]) {
     let mut name: Option<String> = None;
     let mut priority: i64 = 0;
     let mut workspace: Option<String> = None;
+    let mut tracker = autopilot_core::Tracker::Asana;
     let mut no_init = false;
 
     let mut i = 0;
@@ -96,7 +97,12 @@ fn cmd_add(args: &[String]) {
             }
             "--workspace" => {
                 i += 1;
-                workspace = Some(args.get(i).unwrap_or_else(|| die("--workspace требует gid")).clone());
+                workspace = Some(args.get(i).unwrap_or_else(|| die("--workspace требует gid (Asana) или ключ (gleb_tasks)")).clone());
+            }
+            "--tracker" => {
+                i += 1;
+                let t = args.get(i).unwrap_or_else(|| die("--tracker требует asana|gleb_tasks"));
+                tracker = autopilot_core::Tracker::parse(t).unwrap_or_else(|e| die(&e.to_string()));
             }
             "--no-init" => no_init = true,
             other if dir.is_none() && !other.starts_with("--") => {
@@ -107,7 +113,7 @@ fn cmd_add(args: &[String]) {
         i += 1;
     }
 
-    let dir = dir.unwrap_or_else(|| die("usage: autopilot add <dir> [--name N] [--priority P] [--workspace GID] [--no-init]"));
+    let dir = dir.unwrap_or_else(|| die("usage: autopilot add <dir> [--name N] [--priority P] [--workspace GID|KEY] [--tracker asana|gleb_tasks] [--no-init]"));
     let dir = dir
         .canonicalize()
         .unwrap_or_else(|e| die(&format!("каталог {} не существует: {e}", dir.display())));
@@ -140,7 +146,7 @@ fn cmd_add(args: &[String]) {
     );
 
     let gcfg = GlobalConfig::load().unwrap_or_default();
-    let prompt_created = initproj::ensure_files(&entry, &gcfg, workspace.as_deref())
+    let prompt_created = initproj::ensure_files(&entry, &gcfg, workspace.as_deref(), tracker)
         .unwrap_or_else(|e| die(&format!("инициализация файлов: {e}")));
     if let Err(e) = initproj::write_memory(&entry) {
         eprintln!("  ⚠️ память Claude Code не записана: {e}");

@@ -1,15 +1,19 @@
-//! Токен-экономная CLI для Asana. Заменяет Asana MCP-сервер в сессиях автопилота.
-//! Вывод — минимальный plain text; длинные тексты можно подавать через stdin (`-`).
-//!
-//! Конфиг проекта (autopilot.yaml) ищется вверх от текущего каталога
-//! (`<dir>/autopilot/autopilot.yaml`) либо берётся из env AUTOPILOT_DIR —
-//! поэтому одна глобально установленная `asana` работает во всех проектах.
+// Токен-экономная CLI трекера (Asana или gleb_tasks — по `tracker:` в конфиге
+// проекта). Заменяет MCP-серверы трекеров в сессиях автопилота. Бинарь
+// доступен под двумя именами: `asana` (историческое) и `tracker`.
+// Вывод — минимальный plain text; длинные тексты можно подавать через stdin (`-`).
+//
+// Конфиг проекта (autopilot.yaml) ищется вверх от текущего каталога
+// (`<dir>/autopilot/autopilot.yaml`) либо берётся из env AUTOPILOT_DIR —
+// поэтому одна глобально установленная `asana` работает во всех проектах.
 
 use autopilot_core::*;
 use std::io::Read;
 use std::process::exit;
 
-const USAGE: &str = r#"asana — лёгкая CLI для Asana (конфиг: autopilot/autopilot.yaml проекта, поиск вверх от cwd или AUTOPILOT_DIR)
+const USAGE: &str = r#"asana — лёгкая CLI трекера задач: Asana или gleb_tasks, по `tracker:` в конфиге
+(autopilot/autopilot.yaml проекта, поиск вверх от cwd или AUTOPILOT_DIR). Алиас: `tracker`.
+<gid> — gid задачи в Asana либо ключ/uuid задачи в gleb_tasks (напр. SAOBR-12).
 
 КОМАНДЫ:
   asana task <gid>                     Полный контекст задачи: описание, сабтаски,
@@ -25,12 +29,14 @@ const USAGE: &str = r#"asana — лёгкая CLI для Asana (конфиг: au
   asana download <attachment_gid> [dir]
                                        Скачать вложение (скриншот и т.п.) в dir
                                        (по умолчанию — текущая папка), печатает путь.
-                                       В get_asset?asset_id=NNN ссылках NNN = gid вложения.
+                                       Asana: в get_asset?asset_id=NNN ссылках NNN = gid вложения.
+                                       gleb_tasks: идентификатор вида <задача>/<id>, как в контексте.
   asana qa <gid> <comment|->           Комментарий + перенос в qa + assign оператору.
   asana done <gid> <comment|->         Комментарий + перенос в done + assign оператору.
   asana block <gid> <comment|->        Комментарий + assign оператору + перенос в blocked.
 
-Токен: env-переменная из autopilot.yaml (asana.token_env, по умолчанию ASANA_ACCESS_TOKEN).
+Токен: env-переменная из autopilot.yaml (asana.token_env, по умолчанию ASANA_ACCESS_TOKEN;
+для gleb_tasks — gleb_tasks.api_key_env, по умолчанию GLEB_TASKS_API_KEY).
 "#;
 
 fn read_text(arg: &str) -> String {
@@ -146,7 +152,7 @@ fn main() {
                     i += 1;
                 }
                 let gid = client.create_subtask(parent, name, &notes, assignee.as_deref())?;
-                println!("OK: сабтаска создана, GID {gid}");
+                println!("OK: сабтаска создана, ID {gid}");
             }
             "download" => {
                 let gid = args.get(1).unwrap_or_else(|| die("usage: asana download <attachment_gid> [dir]"));

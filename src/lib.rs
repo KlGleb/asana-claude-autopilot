@@ -1,4 +1,10 @@
-//! Общий Asana-клиент и конфиг для автопилота и CLI-утилиты `asana`.
+//! Общий клиент трекера и конфиг для автопилота и CLI-утилиты `asana`/`tracker`.
+//!
+//! Два бэкенда: **Asana** (по умолчанию, `src/asana.rs`) и **gleb_tasks**
+//! (`src/gleb_tasks.rs`, https://tasks.gleb.at). Какой использовать — поле
+//! `tracker:` в `autopilot.yaml` проекта. Всё, что выше сырого API (роли,
+//! маппинг секций по именам, выбор размещения, сборка контекста задачи),
+//! живёт здесь в `Client` и одинаково для обоих бэкендов.
 //!
 //! Проект-независимый: вся идентичность (workspace, роли операторов, маппинг
 //! секций) читается из `autopilot.yaml` в каталоге `autopilot/` проекта.
@@ -7,21 +13,20 @@
 //! проекта каждой задачи.
 
 use serde::Deserialize;
-use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
 
+pub mod asana;
 pub mod claudecli;
 pub mod daemon;
+pub mod gleb_tasks;
 pub mod initproj;
 pub mod registry;
 pub mod runner;
 pub mod telegram;
 
-pub const BASE_URL: &str = "https://app.asana.com/api/1.0";
+pub use asana::BASE_URL;
 
 // ============================ Ошибки ============================
 
@@ -39,10 +44,39 @@ pub type Result<T> = std::result::Result<T, ApiError>;
 
 // ============================ Конфиг ============================
 
+/// Какой трекер стоит за проектом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tracker {
+    Asana,
+    GlebTasks,
+}
+
+impl Tracker {
+    pub fn parse(s: &str) -> Result<Tracker> {
+        match s.trim().to_lowercase().replace('-', "_").as_str() {
+            "asana" => Ok(Tracker::Asana),
+            "gleb_tasks" | "glebtasks" | "tasks" => Ok(Tracker::GlebTasks),
+            other => Err(ApiError(format!("неизвестный tracker «{other}» (ожидается asana | gleb_tasks)"))),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Tracker::Asana => "asana",
+            Tracker::GlebTasks => "gleb_tasks",
+        }
+    }
+}
+
 /// Сырой разбор `autopilot.yaml`.
 #[derive(Debug, Deserialize)]
 struct RawSettings {
-    asana: RawAsana,
+    /// asana (по умолчанию) | gleb_tasks
+    #[serde(default)]
+    tracker: Option<String>,
+    #[serde(default)]
+    asana: Option<RawAsana>,
+    #[serde(default)]
+    gleb_tasks: Option<RawGlebTasks>,
     roles: RawRoles,
     /// role -> имя секции или список имён-синонимов.
     sections: HashMap<String, RawNames>,
@@ -64,23 +98,47 @@ struct RawAsana {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawGlebTasks {
+    #[serde(default = "default_gleb_tasks_url")]
+    url: String,
+    #[serde(default = "default_gleb_tasks_key_env")]
+    api_key_env: String,
+    /// Ключ workspace (SAOBR) — ровно тот, к которому привязан API-ключ.
+    workspace: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawRoles {
     operator: RawOperator,
     agent: RawAgent,
 }
 
+/// Человек-оператор: Asana — `gid`; gleb_tasks — `id` (uuid) или `username`.
 #[derive(Debug, Deserialize)]
 struct RawOperator {
-    gid: String,
+    #[serde(default)]
+    gid: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
     #[serde(default = "default_operator_label")]
     label: String,
 }
 
+/// Аккаунт-агент: Asana — `gid` + `name`; gleb_tasks — можно ничего не
+/// указывать (API-ключ сам «является» агентом Claude Code).
 #[derive(Debug, Deserialize)]
 struct RawAgent {
-    gid: String,
-    /// Отображаемое имя аккаунта-агента в Asana (для детекции авторства).
-    name: String,
+    #[serde(default)]
+    gid: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    /// Отображаемое имя аккаунта-агента (для детекции авторства комментариев).
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default = "default_agent_label")]
     label: String,
 }
@@ -104,6 +162,12 @@ enum RawNames {
 fn default_token_env() -> String {
     "ASANA_ACCESS_TOKEN".into()
 }
+fn default_gleb_tasks_url() -> String {
+    "https://tasks.gleb.at".into()
+}
+fn default_gleb_tasks_key_env() -> String {
+    "GLEB_TASKS_API_KEY".into()
+}
 fn default_operator_label() -> String {
     "operator".into()
 }
@@ -118,10 +182,18 @@ fn default_prompt_file() -> String {
 }
 
 /// Обработанный конфиг автопилота одного проекта.
+///
+/// `*_gid` — идентификаторы в терминах трекера: gid Asana либо uuid gleb_tasks
+/// (для gleb_tasks `workspace` — uuid workspace, `workspace_key` — его ключ).
 #[derive(Debug, Clone)]
 pub struct Settings {
+    pub tracker: Tracker,
+    /// Asana PAT либо API-ключ workspace gleb_tasks.
     pub token: String,
+    /// Базовый URL gleb_tasks (для Asana пусто).
+    pub base_url: String,
     pub workspace: String,
+    pub workspace_key: String,
     pub operator_gid: String,
     pub operator_label: String,
     pub agent_gid: String,
@@ -164,7 +236,8 @@ impl Settings {
         ))
     }
 
-    /// Загружает конфиг из `<dir>/autopilot.yaml`.
+    /// Загружает конфиг из `<dir>/autopilot.yaml`. Для gleb_tasks делает один
+    /// GraphQL-запрос, чтобы превратить ключ workspace и username'ы ролей в id.
     pub fn load_from(dir: &Path) -> Result<Settings> {
         let path = dir.join("autopilot.yaml");
         let raw = std::fs::read_to_string(&path)
@@ -172,12 +245,11 @@ impl Settings {
         let rs: RawSettings = serde_yaml::from_str(&raw)
             .map_err(|e| ApiError(format!("ошибка разбора {}: {e}", path.display())))?;
 
-        let token = std::env::var(&rs.asana.token_env).map_err(|_| {
-            ApiError(format!(
-                "переменная окружения {} не задана (Asana-токен)",
-                rs.asana.token_env
-            ))
-        })?;
+        let tracker = match &rs.tracker {
+            Some(t) => Tracker::parse(t)?,
+            None if rs.asana.is_none() && rs.gleb_tasks.is_some() => Tracker::GlebTasks,
+            None => Tracker::Asana,
+        };
 
         let sections: Vec<(String, Vec<String>)> = rs
             .sections
@@ -192,29 +264,103 @@ impl Settings {
             })
             .collect();
 
-        Ok(Settings {
+        let common = |token, base_url, workspace, workspace_key, operator_gid, agent_gid, agent_name| Settings {
+            tracker,
             token,
-            workspace: rs.asana.workspace,
-            operator_gid: rs.roles.operator.gid,
-            operator_label: rs.roles.operator.label,
-            agent_gid: rs.roles.agent.gid,
-            agent_name: rs.roles.agent.name,
-            agent_label: rs.roles.agent.label,
+            base_url,
+            workspace,
+            workspace_key,
+            operator_gid,
+            operator_label: rs.roles.operator.label.clone(),
+            agent_gid,
+            agent_name,
+            agent_label: rs.roles.agent.label.clone(),
             sections,
-            approved: rs.approved,
-            manual_keywords: rs
-                .heuristics
-                .manual_keywords
-                .iter()
-                .map(|s| s.to_lowercase())
-                .collect(),
-            comment_language: rs.heuristics.comment_language,
-            prompt_file: rs.prompt_file,
-            mismatch_comment: rs.mismatch_comment,
-        })
+            approved: rs.approved.clone(),
+            manual_keywords: rs.heuristics.manual_keywords.iter().map(|s| s.to_lowercase()).collect(),
+            comment_language: rs.heuristics.comment_language.clone(),
+            prompt_file: rs.prompt_file.clone(),
+            mismatch_comment: rs.mismatch_comment.clone(),
+        };
+
+        match tracker {
+            Tracker::Asana => {
+                let a = rs.asana.as_ref().ok_or_else(|| {
+                    ApiError(format!("{}: для tracker asana нужен блок asana: {{ workspace }}", path.display()))
+                })?;
+                let token = std::env::var(&a.token_env).map_err(|_| {
+                    ApiError(format!("переменная окружения {} не задана (Asana-токен)", a.token_env))
+                })?;
+                let operator_gid = rs.roles.operator.gid.clone().ok_or_else(|| {
+                    ApiError(format!("{}: roles.operator.gid обязателен для Asana", path.display()))
+                })?;
+                let agent_gid = rs.roles.agent.gid.clone().ok_or_else(|| {
+                    ApiError(format!("{}: roles.agent.gid обязателен для Asana", path.display()))
+                })?;
+                let agent_name = rs.roles.agent.name.clone().ok_or_else(|| {
+                    ApiError(format!("{}: roles.agent.name обязателен для Asana", path.display()))
+                })?;
+                Ok(common(token, String::new(), a.workspace.clone(), a.workspace.clone(), operator_gid, agent_gid, agent_name))
+            }
+            Tracker::GlebTasks => {
+                let g = rs.gleb_tasks.as_ref().ok_or_else(|| {
+                    ApiError(format!(
+                        "{}: для tracker gleb_tasks нужен блок gleb_tasks: {{ url, api_key_env, workspace }}",
+                        path.display()
+                    ))
+                })?;
+                let token = std::env::var(&g.api_key_env).map_err(|_| {
+                    ApiError(format!(
+                        "переменная окружения {} не задана (API-ключ workspace gleb_tasks)",
+                        g.api_key_env
+                    ))
+                })?;
+                let r = gleb_tasks::GlebTasksApi::resolve(&g.url, &token, &g.workspace)?;
+                let find = |id: &Option<String>, username: &Option<String>, what: &str| -> Result<String> {
+                    if let Some(id) = id {
+                        return Ok(id.clone());
+                    }
+                    if let Some(u) = username {
+                        let u = u.trim().trim_start_matches('@');
+                        return r
+                            .members
+                            .iter()
+                            .find(|(_, un, _)| un.eq_ignore_ascii_case(u))
+                            .map(|(id, _, _)| id.clone())
+                            .ok_or_else(|| {
+                                ApiError(format!("в workspace {} нет участника @{u} ({what})", g.workspace))
+                            });
+                    }
+                    Err(ApiError(format!("{}: для roles.{what} укажи id или username", path.display())))
+                };
+                let operator_gid = find(&rs.roles.operator.id, &rs.roles.operator.username, "operator")?;
+                // Агент по умолчанию — «я» (владелец API-ключа и есть Claude Code).
+                let agent_gid = if rs.roles.agent.id.is_some() || rs.roles.agent.username.is_some() {
+                    find(&rs.roles.agent.id, &rs.roles.agent.username, "agent")?
+                } else {
+                    r.me_id.clone()
+                };
+                let agent_name = rs.roles.agent.name.clone().unwrap_or_else(|| {
+                    r.members
+                        .iter()
+                        .find(|(id, _, _)| *id == agent_gid)
+                        .map(|(_, _, n)| n.clone())
+                        .unwrap_or_else(|| r.me_name.clone())
+                });
+                Ok(common(
+                    token,
+                    g.url.trim_end_matches('/').to_string(),
+                    r.workspace_id,
+                    g.workspace.to_uppercase(),
+                    operator_gid,
+                    agent_gid,
+                    agent_name,
+                ))
+            }
+        }
     }
 
-    /// Конфиг «текущего» проекта (для CLI `asana`): AUTOPILOT_DIR либо поиск вверх от cwd.
+    /// Конфиг «текущего» проекта (для CLI): AUTOPILOT_DIR либо поиск вверх от cwd.
     pub fn load() -> Result<Settings> {
         Self::load_from(&Self::find_dir()?)
     }
@@ -224,7 +370,7 @@ impl Settings {
         let n = name.trim().to_lowercase();
         self.sections
             .iter()
-            .find(|(_, names)| names.iter().any(|w| *w == n))
+            .find(|(_, names)| names.contains(&n))
             .map(|(role, _)| role.as_str())
     }
 
@@ -268,13 +414,9 @@ impl Settings {
     /// Комментарий §2.1: задача в известной, но неразрешённой секции.
     pub fn msg_not_approved(&self, section: &str) -> String {
         if self.is_russian() {
-            format!(
-                "Не беру задачи из секции {section}, переместите её в одну из рабочих секций.",
-            )
+            format!("Не беру задачи из секции {section}, переместите её в одну из рабочих секций.",)
         } else {
-            format!(
-                "I do not take tasks from the {section} section, please move it to a working section.",
-            )
+            format!("I do not take tasks from the {section} section, please move it to a working section.",)
         }
     }
 
@@ -284,16 +426,16 @@ impl Settings {
             return c.clone();
         }
         if self.is_russian() {
-            "Секции в текущем проекте не соответствуют процессу, задача не может быть выполнена."
-                .into()
+            "Секции в текущем проекте не соответствуют процессу, задача не может быть выполнена.".into()
         } else {
-            "The sections in this project do not match the process; the task cannot be handled."
-                .into()
+            "The sections in this project do not match the process; the task cannot be handled.".into()
         }
     }
 }
 
 // ============================ Модели ============================
+// Общие для обоих трекеров. Asana десериализуется в них напрямую (serde),
+// gleb_tasks заполняет их руками из GraphQL-ответа.
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct User {
@@ -317,7 +459,11 @@ pub struct Membership {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Task {
+    /// Идентификатор в трекере: gid Asana либо uuid gleb_tasks.
     pub gid: String,
+    /// Человеческий идентификатор (gleb_tasks: `SAOBR-12`); у Asana нет.
+    #[serde(default)]
+    pub key: Option<String>,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -341,6 +487,10 @@ impl Task {
     pub fn is_subtask(&self) -> bool {
         self.parent.is_some()
     }
+    /// Что показывать человеку и передавать в CLI: ключ (SAOBR-12) либо gid.
+    pub fn display_id(&self) -> &str {
+        self.key.as_deref().unwrap_or(&self.gid)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -350,6 +500,9 @@ pub struct Attachment {
     pub name: String,
     #[serde(default)]
     pub size: u64,
+    /// gleb_tasks: подписанная ссылка на скачивание (15 минут). Asana: нет.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -386,7 +539,7 @@ impl Story {
 pub struct Placement {
     pub project_gid: String,
     pub project_name: String,
-    /// Имя секции как в Asana.
+    /// Имя секции как в трекере.
     pub section_name: String,
     /// Роль секции (todo/in_progress/...), если сопоставилась.
     pub role: Option<String>,
@@ -394,8 +547,15 @@ pub struct Placement {
 
 // ============================ Клиент ============================
 
+/// Сырой API выбранного трекера.
+enum Backend {
+    Asana(asana::AsanaApi),
+    GlebTasks(gleb_tasks::GlebTasksApi),
+}
+
+/// Клиент трекера: сырые операции делегирует бэкенду, логика процесса общая.
 pub struct Client {
-    agent: ureq::Agent,
+    backend: Backend,
     pub settings: Settings,
     /// project_gid -> список секций проекта (кэш для резолва имени в gid).
     section_cache: Mutex<HashMap<String, Vec<Ref>>>,
@@ -403,11 +563,22 @@ pub struct Client {
 
 impl Client {
     pub fn new(settings: Settings) -> Self {
+        let backend = match settings.tracker {
+            Tracker::Asana => Backend::Asana(asana::AsanaApi::new(
+                settings.token.clone(),
+                settings.workspace.clone(),
+                settings.agent_gid.clone(),
+            )),
+            Tracker::GlebTasks => Backend::GlebTasks(gleb_tasks::GlebTasksApi::new(
+                settings.base_url.clone(),
+                settings.token.clone(),
+                settings.workspace.clone(),
+                settings.agent_gid.clone(),
+            )),
+        };
         Client {
+            backend,
             settings,
-            agent: ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(60))
-                .build(),
             section_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -417,193 +588,104 @@ impl Client {
         Ok(Self::new(Settings::load()?))
     }
 
-    /// Один HTTP-запрос с 3 повторами на сетевые ошибки/429/5xx.
-    pub fn request(&self, method: &str, url: &str, body: Option<Value>) -> Result<Value> {
-        let mut last_err = String::new();
-        for attempt in 0..3 {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_secs(5 * attempt as u64));
-            }
-            let req = self
-                .agent
-                .request(method, url)
-                .set("Authorization", &format!("Bearer {}", self.settings.token))
-                .set("Accept", "application/json");
-            let resp = match &body {
-                Some(b) => req.send_json(b.clone()),
-                None => req.call(),
-            };
-            match resp {
-                Ok(r) => {
-                    return r
-                        .into_json::<Value>()
-                        .map_err(|e| ApiError(format!("bad json from {url}: {e}")));
-                }
-                Err(ureq::Error::Status(code, r)) => {
-                    let text = r.into_string().unwrap_or_default();
-                    last_err = format!("HTTP {code} from {url}: {text}");
-                    if code != 429 && code < 500 {
-                        return Err(ApiError(last_err));
-                    }
-                }
-                Err(e) => {
-                    last_err = format!("network error for {url}: {e}");
-                }
-            }
+    pub fn tracker(&self) -> Tracker {
+        self.settings.tracker
+    }
+
+    // ---- Сырые операции (делегирование) ----
+
+    pub fn get_task(&self, id: &str) -> Result<Task> {
+        match &self.backend {
+            Backend::Asana(a) => a.get_task(id),
+            Backend::GlebTasks(g) => g.get_task(id),
         }
-        Err(ApiError(last_err))
-    }
-
-    pub fn get_data(&self, url: &str) -> Result<Value> {
-        Ok(self.request("GET", url, None)?["data"].take())
-    }
-
-    // ---- Задачи ----
-
-    pub fn get_task(&self, gid: &str) -> Result<Task> {
-        let v = self.get_data(&format!(
-            "{BASE_URL}/tasks/{gid}?opt_fields=name,notes,completed,assignee.gid,assignee.name,due_on,permalink_url,memberships.project.gid,memberships.project.name,memberships.section.gid,memberships.section.name"
-        ))?;
-        serde_json::from_value(v).map_err(|e| ApiError(format!("parse task {gid}: {e}")))
     }
 
     /// Все НЕзакрытые задачи, назначенные на аккаунт-агента, во всём workspace.
     /// Это ядро проект-независимого выбора: агент видит только явно назначенное
     /// на него — назначение и есть фильтр «за какие проекты он отвечает».
     pub fn get_assigned_tasks(&self) -> Result<Vec<Task>> {
-        let mut out: Vec<Task> = Vec::new();
-        let mut url = format!(
-            "{BASE_URL}/tasks?assignee={}&workspace={}&completed_since=now&limit=100&opt_fields=name,notes,completed,assignee.gid,due_on,permalink_url,parent.name,memberships.project.gid,memberships.project.name,memberships.section.gid,memberships.section.name",
-            self.settings.agent_gid, self.settings.workspace
-        );
-        loop {
-            let v = self.request("GET", &url, None)?;
-            let batch: Vec<Task> = serde_json::from_value(v["data"].clone())
-                .map_err(|e| ApiError(format!("parse assigned tasks: {e}")))?;
-            out.extend(batch);
-            match v["next_page"]["uri"].as_str() {
-                Some(next) => url = next.to_string(),
-                None => break,
-            }
+        match &self.backend {
+            Backend::Asana(a) => a.get_assigned_tasks(),
+            Backend::GlebTasks(g) => g.get_assigned_tasks(),
         }
-        Ok(out)
     }
 
-    pub fn get_subtasks(&self, gid: &str) -> Result<Vec<Task>> {
-        let v = self.get_data(&format!(
-            "{BASE_URL}/tasks/{gid}/subtasks?limit=100&opt_fields=name,notes,completed,assignee.gid,assignee.name,permalink_url"
-        ))?;
-        serde_json::from_value(v).map_err(|e| ApiError(format!("parse subtasks of {gid}: {e}")))
-    }
-
-    pub fn get_stories(&self, gid: &str) -> Result<Vec<Story>> {
-        let v = self.get_data(&format!(
-            "{BASE_URL}/tasks/{gid}/stories?limit=100&opt_fields=resource_subtype,text,created_at,created_by.name"
-        ))?;
-        serde_json::from_value(v).map_err(|e| ApiError(format!("parse stories of {gid}: {e}")))
-    }
-
-    pub fn add_comment(&self, gid: &str, text: &str) -> Result<()> {
-        self.request(
-            "POST",
-            &format!("{BASE_URL}/tasks/{gid}/stories"),
-            Some(json!({"data": {"text": text}})),
-        )?;
-        Ok(())
-    }
-
-    pub fn move_to_section(&self, task_gid: &str, section_gid: &str) -> Result<()> {
-        self.request(
-            "POST",
-            &format!("{BASE_URL}/sections/{section_gid}/addTask"),
-            Some(json!({"data": {"task": task_gid}})),
-        )?;
-        Ok(())
-    }
-
-    /// assignee: gid пользователя или None (снять).
-    pub fn set_assignee(&self, task_gid: &str, assignee: Option<&str>) -> Result<()> {
-        let val = match assignee {
-            Some(g) => json!(g),
-            None => Value::Null,
-        };
-        self.request(
-            "PUT",
-            &format!("{BASE_URL}/tasks/{task_gid}"),
-            Some(json!({"data": {"assignee": val}})),
-        )?;
-        Ok(())
-    }
-
-    pub fn set_completed(&self, task_gid: &str, completed: bool) -> Result<()> {
-        self.request(
-            "PUT",
-            &format!("{BASE_URL}/tasks/{task_gid}"),
-            Some(json!({"data": {"completed": completed}})),
-        )?;
-        Ok(())
-    }
-
-    pub fn get_attachments(&self, task_gid: &str) -> Result<Vec<Attachment>> {
-        let v = self.get_data(&format!(
-            "{BASE_URL}/tasks/{task_gid}/attachments?opt_fields=name,size,resource_subtype"
-        ))?;
-        serde_json::from_value(v).map_err(|e| ApiError(format!("parse attachments: {e}")))
-    }
-
-    /// Метаданные вложения: имя + одноразовый signed download_url (S3, качается без auth).
-    pub fn attachment_download_url(&self, attachment_gid: &str) -> Result<(String, String)> {
-        let v = self.get_data(&format!(
-            "{BASE_URL}/attachments/{attachment_gid}?opt_fields=name,download_url"
-        ))?;
-        let name = v["name"].as_str().unwrap_or("attachment").to_string();
-        let url = v["download_url"]
-            .as_str()
-            .ok_or_else(|| ApiError(format!("attachment {attachment_gid} has no download_url")))?
-            .to_string();
-        Ok((name, url))
-    }
-
-    /// Скачивает вложение в файл, возвращает путь.
-    pub fn download_attachment(
-        &self,
-        attachment_gid: &str,
-        dest_dir: &std::path::Path,
-    ) -> Result<std::path::PathBuf> {
-        let (name, url) = self.attachment_download_url(attachment_gid)?;
-        // S3 presigned URL: запрос БЕЗ Authorization-заголовка, иначе конфликт подписей
-        let resp = self
-            .agent
-            .get(&url)
-            .call()
-            .map_err(|e| ApiError(format!("download failed: {e}")))?;
-        let mut bytes: Vec<u8> = Vec::new();
-        resp.into_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|e| ApiError(format!("download read failed: {e}")))?;
-        let path = dest_dir.join(format!("{attachment_gid}-{name}"));
-        std::fs::write(&path, &bytes)
-            .map_err(|e| ApiError(format!("write {}: {e}", path.display())))?;
-        Ok(path)
-    }
-
-    pub fn create_subtask(
-        &self,
-        parent_gid: &str,
-        name: &str,
-        notes: &str,
-        assignee: Option<&str>,
-    ) -> Result<String> {
-        let mut data = json!({"name": name, "notes": notes});
-        if let Some(a) = assignee {
-            data["assignee"] = json!(a);
+    pub fn get_subtasks(&self, id: &str) -> Result<Vec<Task>> {
+        match &self.backend {
+            Backend::Asana(a) => a.get_subtasks(id),
+            Backend::GlebTasks(g) => g.get_subtasks(id),
         }
-        let v = self.request(
-            "POST",
-            &format!("{BASE_URL}/tasks/{parent_gid}/subtasks"),
-            Some(json!({"data": data})),
-        )?;
-        Ok(v["data"]["gid"].as_str().unwrap_or_default().to_string())
+    }
+
+    pub fn get_stories(&self, id: &str) -> Result<Vec<Story>> {
+        match &self.backend {
+            Backend::Asana(a) => a.get_stories(id),
+            Backend::GlebTasks(g) => g.get_stories(id),
+        }
+    }
+
+    pub fn add_comment(&self, id: &str, text: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Asana(a) => a.add_comment(id, text),
+            Backend::GlebTasks(g) => g.add_comment(id, text),
+        }
+    }
+
+    /// Перенос в конкретную секцию проекта (gid/id секции уже известен).
+    pub fn move_to_section(&self, task_id: &str, project_id: &str, section_id: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Asana(a) => a.move_to_section(task_id, section_id),
+            Backend::GlebTasks(g) => g.move_to_section(task_id, project_id, section_id),
+        }
+    }
+
+    /// assignee: id пользователя или None (снять).
+    pub fn set_assignee(&self, task_id: &str, assignee: Option<&str>) -> Result<()> {
+        match &self.backend {
+            Backend::Asana(a) => a.set_assignee(task_id, assignee),
+            Backend::GlebTasks(g) => g.set_assignee(task_id, assignee),
+        }
+    }
+
+    pub fn set_completed(&self, task_id: &str, completed: bool) -> Result<()> {
+        match &self.backend {
+            Backend::Asana(a) => a.set_completed(task_id, completed),
+            Backend::GlebTasks(g) => g.set_completed(task_id, completed),
+        }
+    }
+
+    pub fn get_attachments(&self, task_id: &str) -> Result<Vec<Attachment>> {
+        match &self.backend {
+            Backend::Asana(a) => a.get_attachments(task_id),
+            Backend::GlebTasks(g) => g.get_attachments(task_id),
+        }
+    }
+
+    /// Скачивает вложение в файл, возвращает путь. Asana: gid вложения;
+    /// gleb_tasks: `<задача>/<id вложения>`.
+    pub fn download_attachment(&self, attachment_id: &str, dest_dir: &Path) -> Result<PathBuf> {
+        match &self.backend {
+            Backend::Asana(a) => a.download_attachment(attachment_id, dest_dir),
+            Backend::GlebTasks(g) => g.download_attachment(attachment_id, dest_dir),
+        }
+    }
+
+    /// Создать сабтаску; возвращает её идентификатор (gid Asana / ключ gleb_tasks).
+    pub fn create_subtask(&self, parent: &str, name: &str, notes: &str, assignee: Option<&str>) -> Result<String> {
+        match &self.backend {
+            Backend::Asana(a) => a.create_subtask(parent, name, notes, assignee),
+            Backend::GlebTasks(g) => g.create_subtask(parent, name, notes, assignee),
+        }
+    }
+
+    /// Как в контексте печатать идентификатор вложения, чтобы его можно было
+    /// скормить `download` как есть.
+    fn attachment_handle(&self, task: &Task, a: &Attachment) -> String {
+        match self.settings.tracker {
+            Tracker::Asana => a.gid.clone(),
+            Tracker::GlebTasks => format!("{}/{}", task.display_id(), a.gid),
+        }
     }
 
     // ---- Секции проекта (резолв роли -> gid по имени) ----
@@ -613,11 +695,10 @@ impl Client {
         if let Some(s) = self.section_cache.lock().unwrap().get(project_gid) {
             return Ok(s.clone());
         }
-        let v = self.get_data(&format!(
-            "{BASE_URL}/projects/{project_gid}/sections?opt_fields=name&limit=100"
-        ))?;
-        let secs: Vec<Ref> = serde_json::from_value(v)
-            .map_err(|e| ApiError(format!("parse sections of {project_gid}: {e}")))?;
+        let secs = match &self.backend {
+            Backend::Asana(a) => a.project_sections(project_gid)?,
+            Backend::GlebTasks(g) => g.project_sections(project_gid)?,
+        };
         self.section_cache
             .lock()
             .unwrap()
@@ -647,7 +728,7 @@ impl Client {
     /// Переместить задачу в секцию по роли, резолвя её в проекте задачи.
     pub fn move_task_to_role(&self, task_gid: &str, project_gid: &str, role: &str) -> Result<()> {
         let gid = self.resolve_section_gid(project_gid, role)?;
-        self.move_to_section(task_gid, &gid)
+        self.move_to_section(task_gid, project_gid, &gid)
     }
 
     /// Определяет «управляющее» размещение задачи: membership, чья секция
@@ -708,6 +789,15 @@ impl Client {
         }
     }
 
+    /// Идентификаторы задач, на которые ссылается текст: ссылки Asana либо
+    /// (для gleb_tasks) ключи `SAOBR-12` и ссылки `<url>/t/SAOBR-12`.
+    pub fn extract_linked_ids(&self, text: &str) -> Vec<String> {
+        match self.settings.tracker {
+            Tracker::Asana => extract_linked_gids(text),
+            Tracker::GlebTasks => extract_task_keys(text, &self.settings.workspace_key),
+        }
+    }
+
     /// Собирает полный markdown-контекст по задаче: описание, сабтаски,
     /// комментарии, история перемещений, связанные задачи.
     pub fn build_task_context(&self, task: &Task, section_name: &str) -> Result<String> {
@@ -715,12 +805,16 @@ impl Client {
         let stories = self.get_stories(&task.gid)?;
         let agent_gid = self.settings.agent_gid.as_str();
         let agent_name = self.settings.agent_name.as_str();
+        let id_label = match self.settings.tracker {
+            Tracker::Asana => "GID",
+            Tracker::GlebTasks => "Ключ",
+        };
 
         let mut out = String::new();
         out.push_str(&format!(
-            "# Текущая задача\n**Название:** {}\n**GID:** {}\n**Ссылка:** {}\n**Секция:** {}\n",
+            "# Текущая задача\n**Название:** {}\n**{id_label}:** {}\n**Ссылка:** {}\n**Секция:** {}\n",
             task.name,
-            task.gid,
+            task.display_id(),
             task.permalink_url.as_deref().unwrap_or("-"),
             section_name
         ));
@@ -733,11 +827,7 @@ impl Client {
         }
 
         out.push_str("\n## Описание\n");
-        out.push_str(if task.notes.is_empty() {
-            "Нет описания"
-        } else {
-            &task.notes
-        });
+        out.push_str(if task.notes.is_empty() { "Нет описания" } else { &task.notes });
         out.push('\n');
 
         // --- Сабтаски ---
@@ -751,13 +841,7 @@ impl Client {
                 let assignee = st
                     .assignee
                     .as_ref()
-                    .map(|a| {
-                        if a.gid == agent_gid {
-                            agent_name
-                        } else {
-                            a.name.as_str()
-                        }
-                    })
+                    .map(|a| if a.gid == agent_gid { agent_name } else { a.name.as_str() })
                     .unwrap_or("никто");
                 let mut flag = String::new();
                 if !st.completed && st.assignee_gid() == Some(agent_gid) {
@@ -766,7 +850,8 @@ impl Client {
                 }
                 out.push_str(&format!(
                     "- [{mark}] {} — «{}» (исполнитель: {assignee}){flag}\n",
-                    st.gid, st.name
+                    st.display_id(),
+                    st.name
                 ));
                 if !st.notes.is_empty() {
                     for line in st.notes.lines() {
@@ -778,7 +863,7 @@ impl Client {
                 out.push_str(&format!(
                     "\n**ВНИМАНИЕ: {open_for_agent} незакрытых сабтасков назначено на тебя. \
                      Задача НЕ считается выполненной, пока они не сделаны и не закрыты \
-                     (`asana complete <gid>`).**\n"
+                     (`asana complete <id>`).**\n"
                 ));
             }
         }
@@ -788,13 +873,19 @@ impl Client {
         if !attachments.is_empty() {
             out.push_str("\n## Вложения\n");
             for a in &attachments {
-                out.push_str(&format!("- {} — {} ({} байт)\n", a.gid, a.name, a.size));
+                out.push_str(&format!("- {} — {} ({} байт)\n", self.attachment_handle(task, a), a.name, a.size));
             }
-            out.push_str(
-                "Скачать: `asana download <gid> [dir]` — затем открой файл инструментом Read \
-                 (картинки Claude Code видит). Ссылки вида `get_asset?asset_id=NNN` в тексте: NNN — это тот же gid, \
-                 качается той же командой.\n",
-            );
+            match self.settings.tracker {
+                Tracker::Asana => out.push_str(
+                    "Скачать: `asana download <gid> [dir]` — затем открой файл инструментом Read \
+                     (картинки Claude Code видит). Ссылки вида `get_asset?asset_id=NNN` в тексте: NNN — это тот же gid, \
+                     качается той же командой.\n",
+                ),
+                Tracker::GlebTasks => out.push_str(
+                    "Скачать: `asana download <задача>/<id> [dir]` (идентификатор — как напечатан выше) — \
+                     затем открой файл инструментом Read (картинки Claude Code видит).\n",
+                ),
+            }
         }
 
         // --- Комментарии ---
@@ -804,17 +895,12 @@ impl Client {
             out.push_str("Комментариев нет.\n");
         } else {
             for c in &comments {
-                out.push_str(&format!(
-                    "**{} ({})**: {}\n\n",
-                    c.author(),
-                    c.short_date(),
-                    c.text
-                ));
+                out.push_str(&format!("**{} ({})**: {}\n\n", c.author(), c.short_date(), c.text));
             }
         }
 
         // --- Системная история ---
-        out.push_str("\n## История (системные события Asana, НЕ комментарии)\n");
+        out.push_str("\n## История (системные события трекера, НЕ комментарии)\n");
         for s in stories.iter().filter(|s| !s.is_comment()) {
             if !s.text.is_empty() {
                 out.push_str(&format!("- {} {}: {}\n", s.short_date(), s.author(), s.text));
@@ -827,18 +913,23 @@ impl Client {
             full_text.push('\n');
             full_text.push_str(&c.text);
         }
-        let subtask_gids: Vec<&str> = subtasks.iter().map(|s| s.gid.as_str()).collect();
-        let linked: Vec<String> = extract_linked_gids(&full_text)
+        let own: Vec<&str> = std::iter::once(task.display_id())
+            .chain(std::iter::once(task.gid.as_str()))
+            .chain(subtasks.iter().map(|s| s.display_id()))
+            .chain(subtasks.iter().map(|s| s.gid.as_str()))
+            .collect();
+        let linked: Vec<String> = self
+            .extract_linked_ids(&full_text)
             .into_iter()
-            .filter(|g| g != &task.gid && !subtask_gids.contains(&g.as_str()))
+            .filter(|g| !own.contains(&g.as_str()))
             .collect();
         if !linked.is_empty() {
             out.push_str(
                 "\n## Связанные задачи (ТОЛЬКО справочный контекст — это НЕ твоя задача и НЕ причина переоткрытия)\n",
             );
-            for gid in linked {
-                if let Ok(lt) = self.get_task(&gid) {
-                    out.push_str(&format!("### {} (GID: {})\n{}\n\n", lt.name, gid, lt.notes));
+            for id in linked {
+                if let Ok(lt) = self.get_task(&id) {
+                    out.push_str(&format!("### {} ({id_label}: {})\n{}\n\n", lt.name, lt.display_id(), lt.notes));
                 }
             }
         }
@@ -849,20 +940,27 @@ impl Client {
 
 /// Извлекает GID задач из ссылок Asana в тексте (старый /0/… и новый /1/…/task/… форматы).
 pub fn extract_linked_gids(text: &str) -> Vec<String> {
-    let re = regex::Regex::new(
-        r"app\.asana\.com/(?:0/\d+/(\d+)|1/\d+/(?:project/\d+/)?task/(\d+))",
-    )
-    .unwrap();
+    let re = regex::Regex::new(r"app\.asana\.com/(?:0/\d+/(\d+)|1/\d+/(?:project/\d+/)?task/(\d+))").unwrap();
     let mut out = Vec::new();
     for cap in re.captures_iter(text) {
-        let gid = cap
-            .get(1)
-            .or_else(|| cap.get(2))
-            .map(|m| m.as_str().to_string());
+        let gid = cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str().to_string());
         if let Some(g) = gid {
             if !out.contains(&g) {
                 out.push(g);
             }
+        }
+    }
+    out
+}
+
+/// Ключи задач workspace (`SAOBR-12`) в тексте — голые и внутри ссылок `/t/SAOBR-12`.
+pub fn extract_task_keys(text: &str, workspace_key: &str) -> Vec<String> {
+    let re = regex::Regex::new(&format!(r"\b({}-\d+)\b", regex::escape(workspace_key))).unwrap();
+    let mut out = Vec::new();
+    for cap in re.captures_iter(text) {
+        let k = cap[1].to_string();
+        if !out.contains(&k) {
+            out.push(k);
         }
     }
     out

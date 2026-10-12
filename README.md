@@ -1,6 +1,6 @@
 # asana-claude-autopilot
 
-A single always-on daemon that feeds **Asana** tasks to **[Claude Code](https://claude.com/claude-code)** sessions across any number of local projects — with a terminal CLI, per-project priorities, and a **Telegram bot** remote control (inline buttons included).
+A single always-on daemon that feeds **Asana** (or **gleb_tasks**, a self-hosted tracker at tasks.gleb.at) tasks to **[Claude Code](https://claude.com/claude-code)** sessions across any number of local projects — with a terminal CLI, per-project priorities, and a **Telegram bot** remote control (inline buttons included). The tracker is chosen per project (`tracker: asana | gleb_tasks` in `autopilot.yaml`); everything else — the process, the CLI, the prompts — is the same.
 
 You assign a task to the agent's Asana account → the daemon picks it up, moves it to *In Progress*, builds the full task context (description, subtasks, comments, attachments, history), runs one `claude -p` session in the project directory, and the session delivers the work: feature branch, PR, Asana comments, move to *QA*/*Done*, or *Blocked* with questions for the operator.
 
@@ -13,7 +13,7 @@ You assign a task to the agent's Asana account → the daemon picks it up, moves
   daemon.pid / daemon.log / status.json
 
 <your-project>/autopilot/         ← per-project (created by `autopilot add`)
-  autopilot.yaml                  ← Asana identity: workspace, roles, section names
+  autopilot.yaml                  ← tracker (asana | gleb_tasks), workspace, roles, section names
   prompt.md                       ← the session prompt for this project
   logs/session-*.log              ← one log per Claude session
   state/current-task.md           ← context of the task being worked on
@@ -31,7 +31,7 @@ cd asana-claude-autopilot
 cargo install --path .   # installs `autopilot` and `asana` into ~/.cargo/bin
 ```
 
-Requirements: Rust toolchain, `claude` CLI on PATH, an Asana Personal Access Token in `$ASANA_ACCESS_TOKEN` (the agent's account, not yours).
+Requirements: Rust toolchain, `claude` CLI on PATH, and per tracker: an Asana Personal Access Token in `$ASANA_ACCESS_TOKEN` (the agent's account, not yours) and/or a gleb_tasks workspace API key in `$GLEB_TASKS_API_KEY` (Workspace settings → API & MCP; the key already acts as the virtual "Claude Code" member).
 
 ## Quick start
 
@@ -39,7 +39,8 @@ Requirements: Rust toolchain, `claude` CLI on PATH, an Asana Personal Access Tok
 # one-time: global defaults so `add` can fill new project configs
 mkdir -p ~/.autopilot && $EDITOR ~/.autopilot/config.yaml   # see below
 
-autopilot add ~/work/myproject --workspace 1234567890 --priority 5
+autopilot add ~/work/myproject --workspace 1234567890 --priority 5                 # Asana
+autopilot add ~/work/other --tracker gleb_tasks --workspace SAOBR --priority 3    # gleb_tasks (workspace = its key)
 autopilot start          # launch the daemon (background, survives terminal close)
 autopilot status         # daemon + per-project state
 autopilot logs myproject # tail of the latest session log
@@ -60,13 +61,41 @@ defaults:                # used by `autopilot add` to fill new project configs
 
 daemon:
   session_timeout: 10800  # hard kill for a session, seconds
-  no_task_sleep: 600      # sleep when no project has tasks
+  no_task_sleep: 60       # poll interval when no project has tasks = max pickup delay for a new task
   limit_sleep: 1200       # sleep when usage limits are hit on the fallback model too
   fallback_model: opus
 
 telegram:
   token_env: AUTOPILOT_TG_TOKEN   # or `token: "..."` literal (not recommended)
   allowed_chats: [123456789]      # who may control the bot
+```
+
+## gleb_tasks as the tracker
+
+Per-project `autopilot.yaml` for a gleb_tasks workspace (template: `templates/autopilot.gleb_tasks.yaml.tmpl`):
+
+```yaml
+tracker: gleb_tasks
+gleb_tasks:
+  url: https://tasks.gleb.at
+  api_key_env: GLEB_TASKS_API_KEY   # env var holding the workspace API key
+  workspace: SAOBR                  # workspace key (task prefix); the API key is bound to it
+roles:
+  operator: { username: GlebKl, label: gleb }                      # or id: "<uuid>"
+  agent:    { username: claude, name: "Claude Code", label: claude } # optional: the API key IS the agent
+sections: { todo: [todo, Бэклог], in_progress: [in progress], qa: [qa], done: [done], blocked: [blocked], reopen: [reopen] }
+approved: [todo, in_progress, reopen]
+```
+
+Differences from Asana, all handled by the CLI/daemon: task ids are keys (`SAOBR-12`, uuids also accepted), links are `https://tasks.gleb.at/t/SAOBR-12`, attachments are addressed as `<task>/<attachment id>` (printed that way in the task context), and the task history comes from the tracker's activity log. The daemon resolves the workspace key and role usernames to ids on every config load (one GraphQL request). Global defaults for `autopilot add --tracker gleb_tasks` live in `~/.autopilot/config.yaml`:
+
+```yaml
+defaults:
+  gleb_tasks:
+    url: https://tasks.gleb.at
+    api_key_env: GLEB_TASKS_API_KEY
+    operator: { username: GlebKl, label: gleb }
+    agent: { username: claude, name: "Claude Code", label: claude }
 ```
 
 ## Telegram bot
@@ -85,7 +114,7 @@ The bot registers a command menu (Telegram's **Menu** button + autocomplete) and
 
 Buttons per project: ⏸/▶️ toggle, 🔼/🔽 priority, 📜 logs. The account/usage/login features are thin wrappers over the `claude` CLI (`src/claudecli.rs`) — the daemon must have `claude` on PATH (it already does, since it runs the sessions).
 
-## The `asana` CLI
+## The `asana` CLI (alias `tracker`)
 
 A token-cheap plain-text Asana client used inside Claude sessions instead of the Asana MCP server. It finds the project config by walking up from the current directory (or via `AUTOPILOT_DIR`), so one global binary serves every project:
 
@@ -102,7 +131,7 @@ asana qa|done|block <gid> <comment|->   # comment + move + reassign in one call
 
 ## Model & effort per task
 
-Put a directive in the Asana task description (Russian or English): `model: sonnet`, `effort: medium` (low ≈ 2k thinking tokens, medium ≈ 10k, high ≈ 32k). Default model is `opus` with automatic fallback when usage limits are hit.
+Put a directive in the Asana task description (Russian or English): `model: sonnet`, `effort: medium` (low ≈ 2k thinking tokens, medium ≈ 10k, high ≈ 32k). Default model is `fable` with automatic fallback to `opus` when usage limits are hit.
 
 ## Safety notes
 
