@@ -16,10 +16,12 @@ use std::process::{exit, Command, Stdio};
 const USAGE: &str = r#"autopilot — демон, раздающий Asana-задачи Claude Code по всем вашим проектам
 
 ПРОЕКТЫ:
-  autopilot add <dir> [--name N] [--priority P] [--workspace GID|KEY] [--tracker asana|gleb_tasks] [--no-init]
+  autopilot add <dir> [--name N] [--priority P] [--workspace GID|KEY] [--tracker asana|gleb_tasks]
+                [--engine claude|codex] [--no-init]
                                 Добавить проект под контроль (создаёт <dir>/autopilot/
-                                с конфигом и промптом; --no-init = без доводки промпта
-                                через claude). Повторный add обновляет запись.
+                                с конфигом и промптом; --engine = движок сессий, по
+                                умолчанию claude; --no-init = без доводки промпта
+                                агентом). Повторный add обновляет запись.
   autopilot remove <name>       Убрать проект из-под контроля (файлы проекта не трогает).
   autopilot list                Список проектов.
   autopilot pause <name>        Приостановить проект (текущая сессия доработает).
@@ -79,6 +81,7 @@ fn cmd_add(args: &[String]) {
     let mut priority: i64 = 0;
     let mut workspace: Option<String> = None;
     let mut tracker = autopilot_core::Tracker::Asana;
+    let mut engine = autopilot_core::Engine::Claude;
     let mut no_init = false;
 
     let mut i = 0;
@@ -104,6 +107,12 @@ fn cmd_add(args: &[String]) {
                 let t = args.get(i).unwrap_or_else(|| die("--tracker требует asana|gleb_tasks"));
                 tracker = autopilot_core::Tracker::parse(t).unwrap_or_else(|e| die(&e.to_string()));
             }
+            "--engine" => {
+                i += 1;
+                let e = args.get(i).unwrap_or_else(|| die("--engine требует claude|codex"));
+                engine = autopilot_core::Engine::parse(e)
+                    .unwrap_or_else(|| die(&format!("неизвестный engine «{e}» (ожидается claude | codex)")));
+            }
             "--no-init" => no_init = true,
             other if dir.is_none() && !other.starts_with("--") => {
                 dir = Some(PathBuf::from(other));
@@ -113,7 +122,7 @@ fn cmd_add(args: &[String]) {
         i += 1;
     }
 
-    let dir = dir.unwrap_or_else(|| die("usage: autopilot add <dir> [--name N] [--priority P] [--workspace GID|KEY] [--tracker asana|gleb_tasks] [--no-init]"));
+    let dir = dir.unwrap_or_else(|| die("usage: autopilot add <dir> [--name N] [--priority P] [--workspace GID|KEY] [--tracker asana|gleb_tasks] [--engine claude|codex] [--no-init]"));
     let dir = dir
         .canonicalize()
         .unwrap_or_else(|e| die(&format!("каталог {} не существует: {e}", dir.display())));
@@ -146,14 +155,18 @@ fn cmd_add(args: &[String]) {
     );
 
     let gcfg = GlobalConfig::load().unwrap_or_default();
-    let prompt_created = initproj::ensure_files(&entry, &gcfg, workspace.as_deref(), tracker)
+    let prompt_created = initproj::ensure_files(&entry, &gcfg, workspace.as_deref(), tracker, engine)
         .unwrap_or_else(|e| die(&format!("инициализация файлов: {e}")));
     if let Err(e) = initproj::write_memory(&entry) {
         eprintln!("  ⚠️ память Claude Code не записана: {e}");
     }
 
     if prompt_created && !no_init {
-        match initproj::refine_prompt_with_claude(&entry) {
+        // Движок и codex-настройки — из уже записанного autopilot.yaml (если он
+        // был до add, там может стоять другой engine, чем --engine).
+        let refined = autopilot_core::load_engine(&entry.autopilot_dir())
+            .and_then(|(engine, codex)| initproj::refine_prompt(&entry, engine, &codex));
+        match refined {
             Ok(()) => {}
             Err(e) => eprintln!(
                 "  ⚠️ доводка промпта не удалась ({e}) — отредактируй {} вручную",
@@ -161,7 +174,7 @@ fn cmd_add(args: &[String]) {
             ),
         }
     } else if !prompt_created {
-        println!("  промпт уже был — доводку через claude пропускаю");
+        println!("  промпт уже был — доводку агентом пропускаю");
     }
 
     if daemon_pid().is_some() {

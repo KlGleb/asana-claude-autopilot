@@ -2,10 +2,12 @@
 //!  - создаёт `<проект>/autopilot/` с autopilot.yaml и prompt.md из шаблонов;
 //!  - пишет память о автопилоте в каталог auto-memory Claude Code этого проекта
 //!    (чтобы из любого диалога в проекте можно было спросить про автопилот);
-//!  - опционально запускает `claude -p` (sonnet, medium effort), чтобы тот
-//!    заполнил в prompt.md реальную структуру репозиториев и git-процесс.
+//!  - опционально запускает агента (`claude -p` sonnet/medium или `codex exec`
+//!    с medium-эффортом — по движку проекта), чтобы тот заполнил в prompt.md
+//!    реальную структуру репозиториев и git-процесс.
 
 use crate::registry::{home_dir, GlobalConfig, ProjectEntry};
+use crate::engine::{self, Engine};
 use crate::{ApiError, Result, Tracker};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,6 +51,7 @@ pub fn ensure_files(
     gcfg: &GlobalConfig,
     workspace: Option<&str>,
     tracker: Tracker,
+    engine: Engine,
 ) -> Result<bool> {
     let apdir = project.autopilot_dir();
     fs::create_dir_all(project.logs_dir())
@@ -87,6 +90,7 @@ pub fn ensure_files(
                     ("AGENT_GID", ag_gid.as_str()),
                     ("AGENT_NAME", ag_name.as_str()),
                     ("AGENT_LABEL", ag_label.as_str()),
+                    ("ENGINE", engine.name()),
                 ],
             ),
             Tracker::GlebTasks => {
@@ -124,13 +128,19 @@ pub fn ensure_files(
                         ("AGENT_USERNAME", ag_user.as_str()),
                         ("AGENT_NAME", ag_name.as_str()),
                         ("AGENT_LABEL", ag_label.as_str()),
+                        ("ENGINE", engine.name()),
                     ],
                 )
             }
         };
         fs::write(&yaml_path, yaml)
             .map_err(|e| ApiError(format!("write {}: {e}", yaml_path.display())))?;
-        println!("  создан {} (tracker: {})", yaml_path.display(), tracker.name());
+        println!(
+            "  создан {} (tracker: {}, engine: {})",
+            yaml_path.display(),
+            tracker.name(),
+            engine.name()
+        );
         if workspace.is_none() {
             println!("  ⚠️ workspace не задан — впиши его в autopilot.yaml (или используй --workspace)");
         }
@@ -190,9 +200,10 @@ pub fn write_memory(project: &ProjectEntry) -> Result<()> {
     Ok(())
 }
 
-/// Доводка prompt.md силами Claude Code (sonnet, medium effort): вписать
-/// реальные репозитории/команды/ветки. Логи — в autopilot/logs/init-*.log.
-pub fn refine_prompt_with_claude(project: &ProjectEntry) -> Result<()> {
+/// Доводка prompt.md агентом: вписать реальные репозитории/команды/ветки.
+/// Claude — sonnet, medium effort; Codex — модель из `codex.model` (или дефолт
+/// codex), эффорт medium. Логи — в autopilot/logs/init-*.log.
+pub fn refine_prompt(project: &ProjectEntry, engine: Engine, codex: &crate::CodexSettings) -> Result<()> {
     let init_prompt = fill(
         INIT_PROMPT_TMPL,
         &[("PROJECT_DIR", &project.dir.display().to_string())],
@@ -205,20 +216,44 @@ pub fn refine_prompt_with_claude(project: &ProjectEntry) -> Result<()> {
     let log_file = fs::File::create(&log_path)
         .map_err(|e| ApiError(format!("create {}: {e}", log_path.display())))?;
 
-    println!("  запускаю claude (sonnet, medium) для заполнения prompt.md — лог: {}", log_path.display());
-    let mut child = Command::new("claude")
-        .arg("-p")
-        .arg(&init_prompt)
-        .arg("--model")
-        .arg("sonnet")
-        .arg("--dangerously-skip-permissions")
-        .env("MAX_THINKING_TOKENS", "10000")
+    let mut cmd = match engine {
+        Engine::Claude => {
+            println!("  запускаю claude (sonnet, medium) для заполнения prompt.md — лог: {}", log_path.display());
+            let mut c = Command::new("claude");
+            c.arg("-p")
+                .arg(&init_prompt)
+                .arg("--model")
+                .arg("sonnet")
+                .arg("--dangerously-skip-permissions")
+                .env("MAX_THINKING_TOKENS", "10000")
+                .stdin(Stdio::null());
+            c
+        }
+        Engine::Codex => {
+            println!("  запускаю codex (effort medium) для заполнения prompt.md — лог: {}", log_path.display());
+            let mut c = Command::new("codex");
+            c.args(engine::codex_args(
+                &project.dir.display().to_string(),
+                codex.model.as_deref(),
+                Some("medium"),
+                &codex.extra_args,
+            ))
+            .stdin(Stdio::piped());
+            c
+        }
+    };
+    let mut child = cmd
         .current_dir(&project.dir)
-        .stdin(Stdio::null())
+        .env("AUTOPILOT_DIR", project.autopilot_dir())
         .stdout(log_file.try_clone().unwrap())
         .stderr(log_file)
         .spawn()
-        .map_err(|e| ApiError(format!("не удалось запустить claude: {e}")))?;
+        .map_err(|e| ApiError(format!("не удалось запустить {}: {e}", engine.name())))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(init_prompt.as_bytes());
+        // stdin закрывается при drop → EOF для codex.
+    }
 
     // Инициализация не должна длиться дольше 15 минут.
     let deadline = Instant::now() + Duration::from_secs(900);
@@ -230,7 +265,8 @@ pub fn refine_prompt_with_claude(project: &ProjectEntry) -> Result<()> {
                     return Ok(());
                 }
                 return Err(ApiError(format!(
-                    "claude завершился с ошибкой (код {:?}), см. {}",
+                    "{} завершился с ошибкой (код {:?}), см. {}",
+                    engine.name(),
                     status.code(),
                     log_path.display()
                 )));
@@ -248,5 +284,50 @@ pub fn refine_prompt_with_claude(project: &ProjectEntry) -> Result<()> {
             }
             Err(e) => return Err(ApiError(format!("try_wait: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("autopilot-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn templates_carry_engine_and_parse() {
+        for (i, tmpl) in [YAML_TMPL, YAML_GLEB_TASKS_TMPL].iter().enumerate() {
+            let dir = tmp_dir(&format!("tmpl{i}"));
+            let yaml = fill(tmpl, &[("ENGINE", "codex"), ("WORKSPACE", "X")]);
+            fs::write(dir.join("autopilot.yaml"), yaml).unwrap();
+            let (engine, codex) = crate::load_engine(&dir).unwrap();
+            assert_eq!(engine, Engine::Codex);
+            assert_eq!(codex, crate::CodexSettings::default());
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn engine_config_defaults_and_codex_block() {
+        let dir = tmp_dir("cfg");
+        // Старый конфиг без engine: — claude.
+        fs::write(dir.join("autopilot.yaml"), "asana: {workspace: \"1\"}\n").unwrap();
+        assert_eq!(crate::load_engine(&dir).unwrap(), (Engine::Claude, Default::default()));
+        fs::write(
+            dir.join("autopilot.yaml"),
+            "engine: codex\ncodex:\n  model: gpt-5.1-codex\n  extra_args: [\"--profile\", \"night\"]\n",
+        )
+        .unwrap();
+        let (engine, codex) = crate::load_engine(&dir).unwrap();
+        assert_eq!(engine, Engine::Codex);
+        assert_eq!(codex.model.as_deref(), Some("gpt-5.1-codex"));
+        assert_eq!(codex.extra_args, vec!["--profile".to_string(), "night".to_string()]);
+        fs::write(dir.join("autopilot.yaml"), "engine: gemini\n").unwrap();
+        assert!(crate::load_engine(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

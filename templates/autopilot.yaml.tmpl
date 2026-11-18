@@ -38,6 +38,15 @@ heuristics:
   # Язык комментариев автопилота в Asana: ru | en
   comment_language: ru
 
+# Движок агентских сессий: claude (Claude Code, `claude -p`) | codex (OpenAI Codex CLI, `codex exec`).
+# Переопределяется на задаче: поле «Engine» (gleb_tasks) или директива «engine: codex» в описании.
+engine: {{ENGINE}}
+
+# Настройки Codex — используются, когда сессия идёт на engine codex.
+# codex:
+#   model: gpt-5.1-codex        # модель по умолчанию (`-m`); без неё — дефолт codex (~/.codex/config.toml)
+#   extra_args: []              # доп. аргументы `codex exec`, напр. ["--profile", "night"]
+
 prompt_file: prompt.md
 
 mismatch_comment: "Секции в текущем проекте не соответствуют процессу, задача не может быть выполнена"

@@ -34,10 +34,11 @@ const USAGE: &str = r#"asana — лёгкая CLI трекера задач: Asa
   asana qa <gid> <comment|->           Комментарий + перенос в qa + assign оператору.
   asana done <gid> <comment|->         Комментарий + перенос в done + assign оператору.
   asana block <gid> <comment|->        Комментарий + assign оператору + перенос в blocked.
-  asana fields                         (gleb_tasks) Создать в workspace поля «Model» и «Effort»
-                                       (SELECT, для исполнителя Claude Code, необязательные) —
-                                       из них демон берёт модель и эффорт сессии. Имена полей
-                                       настраиваются в autopilot.yaml: fields: {model, effort}.
+  asana fields                         (gleb_tasks) Создать в workspace поля «Model», «Effort»
+                                       и «Engine» (SELECT, для исполнителя-агента, необязательные) —
+                                       из них демон берёт модель, эффорт и движок (claude/codex)
+                                       сессии. Имена полей настраиваются в autopilot.yaml:
+                                       fields: {model, effort, engine}.
 
 Токен: env-переменная из autopilot.yaml (asana.token_env, по умолчанию ASANA_ACCESS_TOKEN;
 для gleb_tasks — gleb_tasks.api_key_env, по умолчанию GLEB_TASKS_API_KEY).

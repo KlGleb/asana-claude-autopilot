@@ -348,7 +348,11 @@ impl Bot {
                 "❌ Не залогинен. Нажми «🔐 Войти» или пришли /login.",
                 None,
             ),
-            Err(e) => self.send(chat_id, &format!("Ошибка `claude auth status`: {e}"), None),
+            Err(e) => self.send(
+                chat_id,
+                &format!("Ошибка `claude auth status`: {e}\n(Команда про аккаунт Claude Code; на сессии codex не влияет.)"),
+                None,
+            ),
         }
     }
 
@@ -360,7 +364,11 @@ impl Bot {
                 }
                 self.send(chat_id, &format!("📈 Лимиты Claude\n\n{text}"), None);
             }
-            Err(e) => self.send(chat_id, &format!("Не удалось получить usage: {e}"), None),
+            Err(e) => self.send(
+                chat_id,
+                &format!("Не удалось получить usage: {e}\n(Это лимиты Claude Code; лимиты codex смотри в самом codex.)"),
+                None,
+            ),
         }
     }
 
@@ -497,8 +505,8 @@ fn help_text() -> String {
     "Автопилот — управление с телефона.\n\n\
      Кнопки меню ниже или команды:\n\
      /status — статус демона и проектов (с кнопками)\n\
-     /account — аккаунт Claude Code (кто залогинен, подписка)\n\
-     /usage — лимиты Claude в процентах\n\
+     /account — аккаунт Claude Code (кто залогинен, подписка; только движок claude)\n\
+     /usage — лимиты Claude в процентах (сессии codex сюда не входят)\n\
      /login — войти в аккаунт Claude (пришлёт ссылку)\n\
      /logs <проект> — хвост последнего лога сессии\n\
      /pause <проект> | /resume <проект>\n\
