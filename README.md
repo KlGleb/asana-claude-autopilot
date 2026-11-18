@@ -1,6 +1,6 @@
 # asana-claude-autopilot
 
-A single always-on daemon that feeds **Asana** (or **gleb_tasks**, a self-hosted tracker at tasks.gleb.at) tasks to **[Claude Code](https://claude.com/claude-code)** sessions across any number of local projects — with a terminal CLI, per-project priorities, and a **Telegram bot** remote control (inline buttons included). The tracker is chosen per project (`tracker: asana | gleb_tasks` in `autopilot.yaml`); everything else — the process, the CLI, the prompts — is the same.
+A single always-on daemon that feeds **Asana** (or **gleb_tasks**, a self-hosted tracker at tasks.gleb.at) tasks to **[Claude Code](https://claude.com/claude-code)** — or **[OpenAI Codex CLI](https://github.com/openai/codex)** — sessions across any number of local projects — with a terminal CLI, per-project priorities, and a **Telegram bot** remote control (inline buttons included). The tracker is chosen per project (`tracker: asana | gleb_tasks` in `autopilot.yaml`); everything else — the process, the CLI, the prompts — is the same.
 
 You assign a task to the agent's Asana account → the daemon picks it up, moves it to *In Progress*, builds the full task context (description, subtasks, comments, attachments, history), runs one `claude -p` session in the project directory, and the session delivers the work: feature branch, PR, Asana comments, move to *QA*/*Done*, or *Blocked* with questions for the operator.
 
@@ -31,7 +31,7 @@ cd asana-claude-autopilot
 cargo install --path .   # installs `autopilot` and `asana` into ~/.cargo/bin
 ```
 
-Requirements: Rust toolchain, `claude` CLI on PATH, and per tracker: an Asana Personal Access Token in `$ASANA_ACCESS_TOKEN` (the agent's account, not yours) and/or a gleb_tasks workspace API key in `$GLEB_TASKS_API_KEY` (Workspace settings → API & MCP; the key already acts as the virtual "Claude Code" member).
+Requirements: Rust toolchain, `claude` CLI on PATH (or `codex` for projects on `engine: codex`, see [Running with Codex](#running-with-codex)), and per tracker: an Asana Personal Access Token in `$ASANA_ACCESS_TOKEN` (the agent's account, not yours) and/or a gleb_tasks workspace API key in `$GLEB_TASKS_API_KEY` (Workspace settings → API & MCP; the key already acts as the virtual "Claude Code" member).
 
 ## Quick start
 
@@ -127,7 +127,7 @@ asana complete <gid>
 asana subtask <parent> <name> [--notes <text|->] [--assignee operator|agent]
 asana download <attachment_gid> [dir]
 asana qa|done|block <gid> <comment|->   # comment + move + reassign in one call
-asana fields              # gleb_tasks: create the Model / Effort custom fields in the workspace
+asana fields              # gleb_tasks: create the Model / Effort / Engine custom fields in the workspace
 ```
 
 ## Model & effort per task
@@ -142,10 +142,66 @@ fields:
 
 Text directives still work for both trackers (and are the only option for Asana): `model: sonnet`, `effort: medium` in the task description, Russian or English. Fields win over text. Effort is passed as `claude --effort <level>`; the default model has automatic fallback to `opus` when usage limits are hit.
 
+## Running with Codex
+
+Every session can run on **OpenAI Codex CLI** instead of Claude Code. The engine is chosen per project and can be overridden per task; the tracker, the `asana`/`tracker` CLI, the process and `autopilot/prompt.md` are shared by both engines.
+
+**1. Install and log in to Codex** (on the machine that runs the daemon):
+
+```sh
+npm i -g @openai/codex
+codex login                       # ChatGPT account, or:
+export OPENAI_API_KEY=sk-...      # API key (put it where the daemon's env comes from, e.g. ~/.zshrc)
+codex exec "say hi"               # sanity check
+```
+
+**2. Connect the project to a self-hosted gleb_tasks instance.** In the instance's web UI open *user settings → API keys* and create an account key (`gt_...`). API keys act as the instance's agent member (by default "Claude Code" / `claude`; the instance can rename it with env `AGENT_NAME=Codex`, `AGENT_USERNAME=codex`). Export the key under the env var named by `gleb_tasks.api_key_env`:
+
+```sh
+export GLEB_TASKS_API_KEY=gt_...
+autopilot add ~/work/myproject --tracker gleb_tasks --workspace TASKS --engine codex
+```
+
+`--engine codex` writes `engine: codex` into the new `autopilot.yaml`, and the one-shot prompt-filling init session runs on `codex exec` too (skip it with `--no-init`). For an existing project, just edit `autopilot.yaml`:
+
+```yaml
+tracker: gleb_tasks
+gleb_tasks:
+  url: https://tasks.example.com     # your instance
+  api_key_env: GLEB_TASKS_API_KEY    # env var with the gt_... key
+  workspace: TASKS                   # workspace key (task prefix)
+roles:
+  operator: { username: GlebKl, label: gleb }
+  agent:    { username: codex, name: "Codex", label: codex }  # match the instance's AGENT_USERNAME/AGENT_NAME
+engine: codex                        # claude (default) | codex
+codex:                               # optional
+  model: gpt-5.1-codex               # default model (-m); omit to use codex's own default (~/.codex/config.toml)
+  extra_args: ["--profile", "night"] # extra `codex exec` args (don't put -m here; use `model`)
+```
+
+**3. Start the daemon** — `autopilot start` (or `autopilot restart` if it is already running; config edits are picked up without a restart). Assign a task to the agent member and watch `autopilot logs myproject`.
+
+**How a Codex session is invoked** (prompt = `autopilot/prompt.md`, fed on stdin; cwd = project dir, `AUTOPILOT_DIR` set):
+
+```sh
+codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --color never \
+  --cd <project dir> [<codex.extra_args>...] [-m <model>] [-c model_reasoning_effort=<low|medium|high>] -
+```
+
+`--dangerously-bypass-approvals-and-sandbox` is the Codex equivalent of `claude --dangerously-skip-permissions`: the workspace-write sandbox has no network, so the session couldn't `git push`, open PRs or call the tracker CLI, and nobody is there to approve commands. `--skip-git-repo-check` lets the project dir be a folder with several repos.
+
+**Per-task overrides** — same mechanism as model/effort: the task's custom field **Engine** (`claude` / `codex`; created by `asana fields`, name configurable via `fields.engine`) or a text directive `engine: codex` (`движок: codex`) in the description. Field > directive > project `engine:`.
+
+**Model / effort with Codex:**
+- Model: the Claude aliases (`fable` / `opus` / `sonnet` / `haiku`) are ignored for Codex; a value that looks like an OpenAI model id (`gpt-…`, `o3`, `…codex…`) is used — from the Model field (add the options to the field yourself) or a `model: gpt-5.1-codex` directive. Otherwise `codex.model`, otherwise codex's own default.
+- Effort: `low` / `medium` / `high` pass through as `-c model_reasoning_effort=…`; `xhigh` / `max` are mapped to `high`.
+
+**What's Claude-only:** the `--fallback-model` / model-fallback on usage limits (a Codex usage-limit error still puts the daemon into `limit_sleep`), and the Telegram `/account`, `/usage`, `/login` commands, which manage the daemon's Claude Code account. The Telegram bot itself stays optional — with no bot token the daemon just logs that and runs without it.
+
 ## Safety notes
 
 - The Asana token never lives in config files — only env var names do.
-- Claude sessions run with `--dangerously-skip-permissions` in your project directory: use a dedicated Asana agent account, review PRs before merging, and keep the daemon on a machine you trust.
+- Claude sessions run with `--dangerously-skip-permissions` (Codex: `--dangerously-bypass-approvals-and-sandbox`) in your project directory: use a dedicated Asana agent account, review PRs before merging, and keep the daemon on a machine you trust.
 - `autopilot stop` kills the whole process group — including a claude session mid-task (the task simply stays in *In Progress* and is picked up next time).
 
 ## License

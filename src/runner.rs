@@ -1,12 +1,14 @@
-//! Выбор задачи и прогон одной claude-сессии для одного проекта.
+//! Выбор задачи и прогон одной агентской сессии (claude или codex) для одного проекта.
 //!
 //! Логика выбора: по всему workspace берутся задачи, назначенные на агента;
 //!   - approved-секция → кандидат на выполнение;
 //!   - известная не-approved секция (qa/blocked/…, кроме done) → §2.1: вернуть оператору;
 //!   - секцию не сопоставить с ролью → «секции не соответствуют процессу» → вернуть оператору;
 //!   - сабтаски и задачи без проекта пропускаются молча.
+//!
 //! Приоритет внутри проекта: in_progress → todo с дедлайном → reopen → todo.
 
+use crate::engine::{self, Engine};
 use crate::registry::{stop_file, GlobalConfig, ProjectEntry};
 use crate::{Client, Placement, Task};
 use chrono::Local;
@@ -24,7 +26,7 @@ pub enum Outcome {
     Stopped,
 }
 
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     println!("[{}] {}", Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
 }
 
@@ -193,39 +195,96 @@ pub fn select_task(client: &Client, project: &ProjectEntry) -> Option<(Task, Pla
     None
 }
 
-/// Модель и эффорт сессии. Источники по убыванию приоритета: custom fields
-/// задачи (имена из `fields:` в autopilot.yaml, по умолчанию «Model»/«Effort»,
-/// TASKS-11) → директивы в тексте («model: sonnet», «effort: high», «Sonnet,
-/// medium effort») → значения по умолчанию (fable, эффорт не задан = «-»).
-fn extract_model_and_effort(settings: &crate::Settings, task: &Task, text: &str) -> (String, String) {
+/// Модель и эффорт сессии для движка `engine`. Источники по убыванию приоритета:
+/// custom fields задачи (имена из `fields:` в autopilot.yaml, по умолчанию
+/// «Model»/«Effort», TASKS-11) → директивы в тексте («model: sonnet»,
+/// «effort: high», «Sonnet, medium effort») → значения по умолчанию.
+///
+/// Claude: модель — алиас claude CLI, по умолчанию fable (всегда Some).
+/// Codex: алиасы Claude игнорируются, берётся только id модели OpenAI
+/// («model: gpt-5.1-codex»); по умолчанию — `codex.model` проекта, иначе None
+/// (дефолт самого codex). Эффорт без значения — «-».
+fn extract_model_and_effort(
+    settings: &crate::Settings,
+    engine: Engine,
+    task: &Task,
+    text: &str,
+) -> (Option<String>, String) {
     let re = |p: &str| RegexBuilder::new(p).case_insensitive(true).build().unwrap();
     let model_re = re(r"(?:модель|model):\s*(opus|sonnet|haiku|fable)");
+    let any_model_re = re(r"(?:модель|model):\s*\**\s*([a-z0-9][a-z0-9._:\-]*)");
     let effort_re = re(r"(?:эффорт|effort):\s*(low|medium|high|xhigh|max)");
     let free_re = re(r"\b(opus|sonnet|haiku|fable)\b[\s,]+(low|medium|high|xhigh|max)\s+effort");
 
-    let from_field = |name: &str, allowed: &[&str]| -> Option<String> {
-        let v = task.field(name)?.trim().to_lowercase();
-        if allowed.contains(&v.as_str()) {
-            Some(v)
-        } else {
-            log(&format!("Поле «{name}» = «{v}» не входит в {} — игнорирую", allowed.join("/")));
-            None
-        }
-    };
+    let field = |name: &str| task.field(name).map(|v| v.trim().to_lowercase()).filter(|v| !v.is_empty());
 
     let free = free_re.captures(text);
-    let model = from_field(&settings.model_field, crate::MODEL_OPTIONS)
-        .or_else(|| model_re.captures(text).map(|c| c[1].to_lowercase()))
-        .or_else(|| free.as_ref().map(|c| c[1].to_lowercase()))
-        .unwrap_or_else(|| "fable".into());
-    let effort = from_field(&settings.effort_field, crate::EFFORT_OPTIONS)
+    let model_field = field(&settings.model_field).filter(|v| {
+        let ok = engine.accepts_model(v);
+        if !ok {
+            log(&format!(
+                "Поле «{}» = «{v}» не подходит движку {} — игнорирую",
+                settings.model_field,
+                engine.name()
+            ));
+        }
+        ok
+    });
+    let model = match engine {
+        Engine::Claude => Some(
+            model_field
+                .or_else(|| model_re.captures(text).map(|c| c[1].to_lowercase()))
+                .or_else(|| free.as_ref().map(|c| c[1].to_lowercase()))
+                .unwrap_or_else(|| "fable".into()),
+        ),
+        Engine::Codex => model_field
+            .or_else(|| {
+                any_model_re
+                    .captures_iter(text)
+                    .map(|c| c[1].to_lowercase())
+                    .find(|m| engine::looks_like_openai_model(m))
+            })
+            .or_else(|| settings.codex.model.clone()),
+    };
+    let effort = field(&settings.effort_field)
+        .filter(|v| {
+            let ok = crate::EFFORT_OPTIONS.contains(&v.as_str());
+            if !ok {
+                log(&format!(
+                    "Поле «{}» = «{v}» не входит в {} — игнорирую",
+                    settings.effort_field,
+                    crate::EFFORT_OPTIONS.join("/")
+                ));
+            }
+            ok
+        })
         .or_else(|| effort_re.captures(text).map(|c| c[1].to_lowercase()))
         .or_else(|| free.as_ref().map(|c| c[2].to_lowercase()))
         .unwrap_or_else(|| "-".into());
     (model, effort)
 }
 
-/// Прогоняет одну claude-сессию по уже выбранной задаче. Пишет status.json,
+/// Параметры сессии по задаче: движок, модель, эффорт. `model_override` (fallback
+/// демона при лимите, напр. opus) применяется, только если подходит движку.
+fn session_params(
+    settings: &crate::Settings,
+    task: &Task,
+    text: &str,
+    model_override: Option<&str>,
+) -> (Engine, Option<String>, String) {
+    let engine = engine::select_engine(task.field(&settings.engine_field), text, settings.engine);
+    let (mut model, effort) = extract_model_and_effort(settings, engine, task, text);
+    if let Some(m) = model_override {
+        if engine.accepts_model(m) {
+            model = Some(m.to_string());
+        } else {
+            log(&format!("Fallback-модель {m} не подходит движку {} — оставляю {:?}", engine.name(), model));
+        }
+    }
+    (engine, model, effort)
+}
+
+/// Прогоняет одну агентскую сессию (claude или codex) по уже выбранной задаче. Пишет status.json,
 /// лог сессии — в `<проект>/autopilot/logs/session-*.log`.
 pub fn run_session(
     project: &ProjectEntry,
@@ -257,15 +316,17 @@ pub fn run_session(
         return Outcome::Error;
     }
 
-    let (mut model, effort) = extract_model_and_effort(&client.settings, &full_task, &context);
-    if let Some(m) = model_override {
-        model = m.to_string();
-    }
+    let (engine, model, effort) = session_params(&client.settings, &full_task, &context, model_override);
+    let model_label = model.clone().unwrap_or_else(|| "по умолчанию".into());
     log(&format!(
         "[{}] Выбрана задача: {} ({}) — проект «{}», секция {}",
         project.name, task.name, task.gid, placement.project_name, placement.section_name
     ));
-    log(&format!("[{}] Модель: {model}, Эффорт: {effort}", project.name));
+    log(&format!(
+        "[{}] Движок: {}, Модель: {model_label}, Эффорт: {effort}",
+        project.name,
+        engine.name()
+    ));
 
     if role != "in_progress" {
         if let Err(e) = client.move_task_to_role(&task.gid, &placement.project_gid, "in_progress") {
@@ -293,40 +354,68 @@ pub fn run_session(
         }
     };
 
-    let mut cmd = Command::new("claude");
-    cmd.arg("-p")
-        .arg(&prompt)
-        .arg("--model")
-        .arg(&model)
-        .arg("--dangerously-skip-permissions")
-        .current_dir(&project.dir)
+    let mut cmd = match engine {
+        Engine::Claude => {
+            let mut c = Command::new("claude");
+            c.args(engine::claude_args(
+                &prompt,
+                model.as_deref().unwrap_or("fable"),
+                &effort,
+                &gcfg.daemon.fallback_model,
+            ))
+            .stdin(Stdio::null());
+            c
+        }
+        Engine::Codex => {
+            let mut c = Command::new("codex");
+            c.args(engine::codex_args(
+                &project.dir.display().to_string(),
+                model.as_deref(),
+                Some(effort.as_str()),
+                &client.settings.codex.extra_args,
+            ))
+            // Промпт — в stdin (последний аргумент `-`).
+            .stdin(Stdio::piped());
+            c
+        }
+    };
+    cmd.current_dir(&project.dir)
         .env("AUTOPILOT_DIR", &apdir) // чтобы глобальная `asana` находила конфиг проекта
-        .stdin(Stdio::null());
-    if model != gcfg.daemon.fallback_model {
-        cmd.arg("--fallback-model").arg(&gcfg.daemon.fallback_model);
-    }
-    // Эффорт — штатный флаг claude CLI (low/medium/high/xhigh/max); без него — дефолт CLI.
-    if crate::EFFORT_OPTIONS.contains(&effort.as_str()) {
-        cmd.arg("--effort").arg(&effort);
-    }
-    cmd.stdout(log_file.try_clone().unwrap()).stderr(log_file);
+        .stdout(log_file.try_clone().unwrap())
+        .stderr(log_file);
 
-    log(&format!("[{}] Запуск Claude Code (модель: {model}) -> {}", project.name, log_path.display()));
+    let status_model = match engine {
+        Engine::Claude => model_label.clone(),
+        Engine::Codex => format!("codex/{model_label}"),
+    };
+    log(&format!(
+        "[{}] Запуск {} (модель: {model_label}) -> {}",
+        project.name,
+        engine.title(),
+        log_path.display()
+    ));
     DaemonStatus::set("session", |st| {
         st.project = Some(project.name.clone());
         st.task_gid = Some(task.gid.clone());
         st.task_name = Some(task.name.clone());
-        st.model = Some(model.clone());
+        st.model = Some(status_model.clone());
         st.session_log = Some(log_path.display().to_string());
     });
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            log(&format!("[{}] Не удалось запустить claude: {e}", project.name));
+            log(&format!("[{}] Не удалось запустить {}: {e}", project.name, engine.name()));
             return Outcome::Error;
         }
     };
+    if let Some(mut stdin) = child.stdin.take() {
+        // Пишем в отдельном потоке: большой промпт не должен блокировать watchdog.
+        let prompt = prompt.clone();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(prompt.as_bytes());
+        });
+    }
 
     // Ожидание с хард-таймаутом
     let timeout = gcfg.daemon.session_timeout;
@@ -379,7 +468,11 @@ pub fn run_session(
         return Outcome::Limit;
     }
 
-    log(&format!("[{}] Claude Code завершился с ошибкой (код {exit_code}), не похоже на лимит.", project.name));
+    log(&format!(
+        "[{}] {} завершился с ошибкой (код {exit_code}), не похоже на лимит.",
+        project.name,
+        engine.title()
+    ));
     if sleep_checking_stop(300) {
         return Outcome::Stopped;
     }
@@ -415,7 +508,7 @@ pub fn tail_file(path: &Path, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldValue, Settings, Tracker};
+    use crate::{CodexSettings, FieldValue, Settings, Tracker};
 
     fn settings() -> Settings {
         Settings {
@@ -437,6 +530,17 @@ mod tests {
             mismatch_comment: None,
             model_field: "Model".into(),
             effort_field: "Effort".into(),
+            engine_field: "Engine".into(),
+            engine: Engine::Claude,
+            codex: CodexSettings::default(),
+        }
+    }
+
+    fn codex_settings(default_model: Option<&str>) -> Settings {
+        Settings {
+            engine: Engine::Codex,
+            codex: CodexSettings { model: default_model.map(String::from), extra_args: Vec::new() },
+            ..settings()
         }
     }
 
@@ -450,31 +554,69 @@ mod tests {
         }
     }
 
+    fn me(s: &Settings, engine: Engine, task: &Task, text: &str) -> (Option<String>, String) {
+        extract_model_and_effort(s, engine, task, text)
+    }
+
+    fn pair(m: &str, e: &str) -> (Option<String>, String) {
+        (Some(m.into()), e.into())
+    }
+
     #[test]
     fn defaults_when_nothing_is_set() {
-        assert_eq!(extract_model_and_effort(&settings(), &task_with(&[]), "просто текст"), ("fable".into(), "-".into()));
+        assert_eq!(me(&settings(), Engine::Claude, &task_with(&[]), "просто текст"), pair("fable", "-"));
     }
 
     #[test]
     fn fields_win_over_text_directives() {
         let task = task_with(&[("model", "Sonnet"), ("EFFORT", "xhigh")]);
-        let (m, e) = extract_model_and_effort(&settings(), &task, "model: opus\neffort: low");
-        assert_eq!((m.as_str(), e.as_str()), ("sonnet", "xhigh"));
+        assert_eq!(me(&settings(), Engine::Claude, &task, "model: opus\neffort: low"), pair("sonnet", "xhigh"));
     }
 
     #[test]
     fn text_directives_fill_what_fields_leave_empty() {
         let task = task_with(&[("Effort", "max")]);
-        let (m, e) = extract_model_and_effort(&settings(), &task, "модель: haiku");
-        assert_eq!((m.as_str(), e.as_str()), ("haiku", "max"));
-        let (m, e) = extract_model_and_effort(&settings(), &task_with(&[]), "Sonnet, medium effort");
-        assert_eq!((m.as_str(), e.as_str()), ("sonnet", "medium"));
+        assert_eq!(me(&settings(), Engine::Claude, &task, "модель: haiku"), pair("haiku", "max"));
+        assert_eq!(me(&settings(), Engine::Claude, &task_with(&[]), "Sonnet, medium effort"), pair("sonnet", "medium"));
     }
 
     #[test]
     fn unknown_field_values_are_ignored() {
         let task = task_with(&[("Model", "gpt"), ("Effort", "ultra")]);
-        let (m, e) = extract_model_and_effort(&settings(), &task, "effort: high");
-        assert_eq!((m.as_str(), e.as_str()), ("fable", "high"));
+        assert_eq!(me(&settings(), Engine::Claude, &task, "effort: high"), pair("fable", "high"));
+        // id модели OpenAI для claude не годится.
+        assert_eq!(me(&settings(), Engine::Claude, &task_with(&[]), "model: gpt-5"), pair("fable", "-"));
+    }
+
+    #[test]
+    fn codex_ignores_claude_models_and_falls_back_to_default() {
+        let s = codex_settings(Some("gpt-5.1-codex"));
+        let task = task_with(&[("Model", "opus"), ("Effort", "high")]);
+        assert_eq!(me(&s, Engine::Codex, &task, "model: sonnet"), pair("gpt-5.1-codex", "high"));
+        // Без codex.model — дефолт самого codex (None).
+        let s = codex_settings(None);
+        assert_eq!(me(&s, Engine::Codex, &task_with(&[]), "Sonnet, medium effort"), (None, "medium".into()));
+    }
+
+    #[test]
+    fn codex_takes_openai_models_from_fields_and_text() {
+        let s = codex_settings(Some("gpt-5.1-codex"));
+        assert_eq!(me(&s, Engine::Codex, &task_with(&[("Model", "o3")]), "model: gpt-5"), pair("o3", "-"));
+        assert_eq!(me(&s, Engine::Codex, &task_with(&[]), "model: opus\nmodel: GPT-5"), pair("gpt-5", "-"));
+    }
+
+    #[test]
+    fn session_params_pick_engine_and_respect_override() {
+        // Проект на claude, задача просит codex директивой; fallback opus к codex не применяется.
+        let task = task_with(&[]);
+        let (e, m, _) = session_params(&settings(), &task, "engine: codex", Some("opus"));
+        assert_eq!((e, m), (Engine::Codex, None));
+        // Поле Engine задачи перекрывает engine: codex проекта.
+        let task = task_with(&[("Engine", "claude")]);
+        let (e, m, _) = session_params(&codex_settings(None), &task, "", Some("opus"));
+        assert_eq!((e, m.as_deref()), (Engine::Claude, Some("opus")));
+        // Проект на codex по умолчанию.
+        let (e, m, _) = session_params(&codex_settings(Some("gpt-5")), &task_with(&[]), "", None);
+        assert_eq!((e, m.as_deref()), (Engine::Codex, Some("gpt-5")));
     }
 }

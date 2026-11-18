@@ -20,6 +20,7 @@ use std::sync::Mutex;
 pub mod asana;
 pub mod claudecli;
 pub mod daemon;
+pub mod engine;
 pub mod gleb_tasks;
 pub mod initproj;
 pub mod registry;
@@ -27,6 +28,7 @@ pub mod runner;
 pub mod telegram;
 
 pub use asana::BASE_URL;
+pub use engine::{CodexSettings, Engine};
 
 // ============================ Ошибки ============================
 
@@ -91,6 +93,23 @@ struct RawSettings {
     /// Имена custom fields задачи, из которых берутся модель и эффорт сессии (gleb_tasks).
     #[serde(default)]
     fields: RawFields,
+    /// Движок сессий проекта: claude (по умолчанию) | codex.
+    #[serde(default)]
+    engine: Option<String>,
+    /// Настройки Codex CLI (для engine: codex или задач с полем/директивой codex).
+    #[serde(default)]
+    codex: RawCodex,
+}
+
+/// Блок `codex:` в autopilot.yaml.
+#[derive(Debug, Default, Deserialize)]
+struct RawCodex {
+    /// Модель по умолчанию (`codex exec -m`); пусто — дефолт codex.
+    #[serde(default)]
+    model: Option<String>,
+    /// Доп. аргументы `codex exec` (напр. ["--profile", "night"]).
+    #[serde(default)]
+    extra_args: Vec<String>,
 }
 
 /// Custom fields задачи с параметрами сессии (TASKS-11). Поля SELECT, привязанные
@@ -102,11 +121,14 @@ struct RawFields {
     model: String,
     #[serde(default = "default_effort_field")]
     effort: String,
+    /// Поле с движком сессии (claude/codex).
+    #[serde(default = "default_engine_field")]
+    engine: String,
 }
 
 impl Default for RawFields {
     fn default() -> Self {
-        RawFields { model: default_model_field(), effort: default_effort_field() }
+        RawFields { model: default_model_field(), effort: default_effort_field(), engine: default_engine_field() }
     }
 }
 
@@ -206,11 +228,47 @@ fn default_model_field() -> String {
 fn default_effort_field() -> String {
     "Effort".into()
 }
+fn default_engine_field() -> String {
+    "Engine".into()
+}
 
 /// Допустимые значения поля модели (алиасы claude CLI).
 pub const MODEL_OPTIONS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
 /// Допустимые значения поля эффорта (`claude --effort`).
 pub const EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// `engine:` + `codex:` из сырого конфига → движок проекта и настройки Codex.
+fn engine_settings(engine: Option<&str>, codex: &RawCodex, path: &Path) -> Result<(Engine, CodexSettings)> {
+    let engine = match engine.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Engine::Claude,
+        Some(e) => Engine::parse(e).ok_or_else(|| {
+            ApiError(format!("{}: неизвестный engine «{e}» (ожидается claude | codex)", path.display()))
+        })?,
+    };
+    let codex = CodexSettings {
+        model: codex.model.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from),
+        extra_args: codex.extra_args.clone(),
+    };
+    Ok((engine, codex))
+}
+
+/// Только движок проекта из `<dir>/autopilot.yaml` — без токена трекера и сети
+/// (для `autopilot add`, где полный `Settings::load_from` ещё может не пройти).
+pub fn load_engine(dir: &Path) -> Result<(Engine, CodexSettings)> {
+    #[derive(Deserialize)]
+    struct RawEngineOnly {
+        #[serde(default)]
+        engine: Option<String>,
+        #[serde(default)]
+        codex: RawCodex,
+    }
+    let path = dir.join("autopilot.yaml");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| ApiError(format!("не могу прочитать {}: {e}", path.display())))?;
+    let r: RawEngineOnly = serde_yaml::from_str(&raw)
+        .map_err(|e| ApiError(format!("ошибка разбора {}: {e}", path.display())))?;
+    engine_settings(r.engine.as_deref(), &r.codex, &path)
+}
 
 /// Обработанный конфиг автопилота одного проекта.
 ///
@@ -241,6 +299,12 @@ pub struct Settings {
     pub model_field: String,
     /// Имя custom field задачи с эффортом сессии (по умолчанию «Effort»).
     pub effort_field: String,
+    /// Имя custom field задачи с движком сессии (по умолчанию «Engine»).
+    pub engine_field: String,
+    /// Движок сессий проекта (`engine:`; по умолчанию claude).
+    pub engine: Engine,
+    /// Блок `codex:` из autopilot.yaml.
+    pub codex: CodexSettings,
 }
 
 impl Settings {
@@ -286,6 +350,8 @@ impl Settings {
             None => Tracker::Asana,
         };
 
+        let (engine, codex) = engine_settings(rs.engine.as_deref(), &rs.codex, &path)?;
+
         let sections: Vec<(String, Vec<String>)> = rs
             .sections
             .into_iter()
@@ -318,6 +384,9 @@ impl Settings {
             mismatch_comment: rs.mismatch_comment.clone(),
             model_field: rs.fields.model.trim().to_string(),
             effort_field: rs.fields.effort.trim().to_string(),
+            engine_field: rs.fields.engine.trim().to_string(),
+            engine,
+            codex: codex.clone(),
         };
 
         match tracker {
@@ -756,7 +825,7 @@ impl Client {
 
     /// Список секций проекта (кэшируется на время жизни клиента).
     /// Создаёт в workspace custom fields с параметрами сессии (`fields:` в конфиге:
-    /// «Model» и «Effort», SELECT, для исполнителя-агента, необязательные). Только gleb_tasks.
+    /// «Model», «Effort» и «Engine», SELECT, для исполнителя-агента, необязательные). Только gleb_tasks.
     pub fn ensure_session_fields(&self) -> Result<Vec<String>> {
         match &self.backend {
             Backend::Asana(_) => Err(ApiError(
@@ -767,6 +836,7 @@ impl Client {
             Backend::GlebTasks(g) => Ok(vec![
                 g.ensure_select_field(&self.settings.model_field, MODEL_OPTIONS)?,
                 g.ensure_select_field(&self.settings.effort_field, EFFORT_OPTIONS)?,
+                g.ensure_select_field(&self.settings.engine_field, engine::ENGINE_OPTIONS)?,
             ]),
         }
     }
