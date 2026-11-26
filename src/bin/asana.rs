@@ -31,6 +31,11 @@ const USAGE: &str = r#"asana — лёгкая CLI трекера задач: Asa
                                        (по умолчанию — текущая папка), печатает путь.
                                        Asana: в get_asset?asset_id=NNN ссылках NNN = gid вложения.
                                        gleb_tasks: идентификатор вида <задача>/<id>, как в контексте.
+  asana attach <gid> <file>… [--name <имя>]
+                                       Приложить файл(ы) к задаче (видео прогона, скриншоты,
+                                       логи); печатает id и имя каждого вложения. --name —
+                                       имя вложения (только для одного файла). Content-Type —
+                                       по расширению. Лимит: gleb_tasks 500 MB, Asana 100 MB.
   asana qa <gid> <comment|->           Комментарий + перенос в qa + assign оператору.
   asana done <gid> <comment|->         Комментарий + перенос в done + assign оператору.
   asana block <gid> <comment|->        Комментарий + assign оператору + перенос в blocked.
@@ -71,6 +76,60 @@ fn resolve_assignee(s: &Settings, who: &str) -> Option<Option<String>> {
     } else {
         None
     }
+}
+
+/// Аргументы `attach`: задача, файлы, необязательное имя вложения.
+#[derive(Debug, PartialEq)]
+struct AttachArgs {
+    task: String,
+    files: Vec<String>,
+    name: Option<String>,
+}
+
+const ATTACH_USAGE: &str = "usage: asana attach <gid> <file>… [--name <имя>]";
+
+/// Разбор `attach <gid> <file>… [--name <имя>]` (args — без самой команды).
+/// `--name` можно указать в любом месте; `--` отключает разбор флагов дальше.
+fn parse_attach_args(args: &[String]) -> std::result::Result<AttachArgs, String> {
+    let mut positional: Vec<String> = Vec::new();
+    let mut name: Option<String> = None;
+    let mut flags_done = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if !flags_done && a == "--" {
+            flags_done = true;
+        } else if !flags_done && (a == "--name" || a.starts_with("--name=")) {
+            let v = match a.strip_prefix("--name=") {
+                Some(v) => v.to_string(),
+                None => {
+                    i += 1;
+                    args.get(i).cloned().ok_or("--name needs a value")?
+                }
+            };
+            if v.trim().is_empty() {
+                return Err("--name: пустое имя".into());
+            }
+            if name.replace(v).is_some() {
+                return Err("--name указан дважды".into());
+            }
+        } else if !flags_done && a.starts_with("--") {
+            return Err(format!("unknown flag {a}"));
+        } else {
+            positional.push(a.clone());
+        }
+        i += 1;
+    }
+    let mut it = positional.into_iter();
+    let task = it.next().ok_or(ATTACH_USAGE)?;
+    let files: Vec<String> = it.collect();
+    if files.is_empty() {
+        return Err(format!("нужен хотя бы один файл\n{ATTACH_USAGE}"));
+    }
+    if name.is_some() && files.len() > 1 {
+        return Err("--name можно указать только при одном файле".into());
+    }
+    Ok(AttachArgs { task, files, name })
 }
 
 /// Управляющий проект задачи (для резолва целевой секции по роли).
@@ -164,6 +223,25 @@ fn main() {
                 let path = client.download_attachment(gid, &dir)?;
                 println!("OK: {}", path.display());
             }
+            "attach" => {
+                let a = parse_attach_args(&args[1..]).unwrap_or_else(|e| die(&e));
+                // Сначала проверяем, что все файлы на месте, чтобы не загрузить половину.
+                for f in &a.files {
+                    let p = std::path::Path::new(f);
+                    if !p.is_file() {
+                        die(&format!("{f}: файл не найден"));
+                    }
+                }
+                for f in &a.files {
+                    let att = client.upload_attachment(&a.task, std::path::Path::new(f), a.name.as_deref())?;
+                    println!(
+                        "OK: {} — {} ({})",
+                        client.attachment_ref(&a.task, &att),
+                        att.name,
+                        human_size(att.size)
+                    );
+                }
+            }
             "qa" => {
                 let gid = args.get(1).unwrap_or_else(|| die("usage: asana qa <gid> <comment|->"));
                 let text = read_text(args.get(2).unwrap_or_else(|| die("comment required")));
@@ -210,5 +288,55 @@ fn main() {
 
     if let Err(e) = result {
         die(&e.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn attach_single_file() {
+        assert_eq!(
+            parse_attach_args(&v(&["AUTOPILOT-3", "run.mp4"])).unwrap(),
+            AttachArgs { task: "AUTOPILOT-3".into(), files: v(&["run.mp4"]), name: None }
+        );
+    }
+
+    #[test]
+    fn attach_many_files() {
+        let a = parse_attach_args(&v(&["123", "a.png", "b.png", "e2e.log"])).unwrap();
+        assert_eq!(a.task, "123");
+        assert_eq!(a.files, v(&["a.png", "b.png", "e2e.log"]));
+    }
+
+    #[test]
+    fn attach_name_anywhere() {
+        let want = AttachArgs { task: "T-1".into(), files: v(&["x.mp4"]), name: Some("Прогон".into()) };
+        assert_eq!(parse_attach_args(&v(&["T-1", "x.mp4", "--name", "Прогон"])).unwrap(), want);
+        assert_eq!(parse_attach_args(&v(&["--name", "Прогон", "T-1", "x.mp4"])).unwrap(), want);
+        assert_eq!(parse_attach_args(&v(&["T-1", "--name=Прогон", "x.mp4"])).unwrap(), want);
+    }
+
+    #[test]
+    fn attach_double_dash() {
+        let a = parse_attach_args(&v(&["T-1", "--", "--name"])).unwrap();
+        assert_eq!(a.files, v(&["--name"]));
+        assert_eq!(a.name, None);
+    }
+
+    #[test]
+    fn attach_errors() {
+        assert!(parse_attach_args(&v(&[])).is_err());
+        assert!(parse_attach_args(&v(&["T-1"])).is_err());
+        assert!(parse_attach_args(&v(&["T-1", "x.mp4", "--name"])).is_err());
+        assert!(parse_attach_args(&v(&["T-1", "x.mp4", "--name", " "])).is_err());
+        assert!(parse_attach_args(&v(&["T-1", "a", "b", "--name", "n"])).is_err());
+        assert!(parse_attach_args(&v(&["T-1", "a", "--name", "n", "--name", "m"])).is_err());
+        assert!(parse_attach_args(&v(&["T-1", "a", "--bogus"])).is_err());
     }
 }

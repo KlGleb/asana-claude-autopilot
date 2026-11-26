@@ -18,7 +18,7 @@ cargo run --bin autopilot -- status    # run a subcommand without installing
 cargo run --bin asana -- task <gid>
 ```
 
-Unit tests are few (`cargo test`: model/effort selection in `runner.rs`). To exercise the daemon loop without backgrounding it, use `autopilot run` (runs the daemon body in the current terminal). `autopilot __daemon` is the hidden subcommand the backgrounded process actually execs — don't call it directly.
+Unit tests are few (`cargo test`: model/effort selection in `runner.rs`, attachment Content-Type in `lib.rs`, `attach` arg parsing in `bin/asana.rs`). To exercise the daemon loop without backgrounding it, use `autopilot run` (runs the daemon body in the current terminal). `autopilot __daemon` is the hidden subcommand the backgrounded process actually execs — don't call it directly.
 
 ## The two-layer state model (read this first)
 
@@ -62,7 +62,7 @@ There is no local blocked-list: the Asana `blocked` section (plus reassignment t
 3. Move task to `in_progress`, then spawn `claude -p <prompt> --model <m> --dangerously-skip-permissions --fallback-model <fb> [--effort <level>]` in the project dir with `AUTOPILOT_DIR` set.
 4. Watchdog kills the child at `daemon.session_timeout`. On non-zero exit, the log tail is regex-matched for usage-limit phrases → `Outcome::Limit` (triggers model fallback, then `limit_sleep`); otherwise `Outcome::Error`.
 
-The session itself does the real work by calling the `asana` CLI (comment / move / qa / done / block / subtask / download) — that binary is the session's only intended tracker surface, deliberately used instead of the trackers' MCP servers to save tokens. It serves both trackers: ids are Asana gids or gleb_tasks keys.
+The session itself does the real work by calling the `asana` CLI (comment / move / qa / done / block / subtask / download / attach) — that binary is the session's only intended tracker surface, deliberately used instead of the trackers' MCP servers to save tokens. It serves both trackers: ids are Asana gids or gleb_tasks keys.
 
 ## Process-group semantics
 

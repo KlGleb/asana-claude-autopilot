@@ -15,6 +15,7 @@ asana assign <gid> <operator|agent|none>
 asana complete <gid>          # close a task/subtask (completed=true)
 asana subtask <parent_gid> <name> [--notes <text|->] [--assignee operator|agent]
 asana download <attachment_gid> [dir]   # download an attachment, prints the path
+asana attach <gid> <file>… [--name <n>] # attach file(s) to the task (test-run video, screenshots, logs)
 asana qa <gid> <comment|->    # comment + move to qa + assign operator (one call)
 asana done <gid> <comment|->  # comment + move to done + assign operator (one call)
 asana block <gid> <comment|-> # comment + assign operator + move to blocked (one call)

@@ -2,7 +2,7 @@
 //! общие модели (`Task`, `Story`, `Attachment`, `Ref`). Логика процесса
 //! (роли, секции, контекст) живёт в `Client` (lib.rs) и не знает про Asana.
 
-use crate::{ApiError, Attachment, Ref, Result, Story, Task};
+use crate::{ApiError, Attachment, Ref, Result, Story, Task, Upload};
 use serde_json::{json, Value};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -178,6 +178,50 @@ impl AsanaApi {
     pub fn download_attachment(&self, attachment_gid: &str, dest_dir: &Path) -> Result<PathBuf> {
         let (name, url) = self.attachment_download_url(attachment_gid)?;
         download_signed(&self.agent, &url, dest_dir, &format!("{attachment_gid}-{name}"))
+    }
+
+    /// `POST /attachments` (multipart/form-data: `parent`, `file`). Тело собирается
+    /// из префикса, самого файла и суффикса — файл читается потоково.
+    pub fn upload_attachment(&self, task_gid: &str, up: Upload) -> Result<Attachment> {
+        let boundary = format!("autopilot-{:x}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0));
+        let fname = up.name.replace(['"', '\r', '\n'], "_");
+        let head = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"parent\"\r\n\r\n{task_gid}\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\n\
+             Content-Type: {}\r\n\r\n",
+            up.content_type
+        );
+        let tail = format!("\r\n--{boundary}--\r\n");
+        let len = head.len() as u64 + up.size + tail.len() as u64;
+        let body = std::io::Cursor::new(head.into_bytes())
+            .chain(up.file.take(up.size))
+            .chain(std::io::Cursor::new(tail.into_bytes()));
+        let resp = crate::upload_agent()
+            .post(&format!("{BASE_URL}/attachments"))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Accept", "application/json")
+            .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+            .set("Content-Length", &len.to_string())
+            .send(body);
+        let v: Value = match resp {
+            Ok(r) => r.into_json().map_err(|e| ApiError(format!("bad json from /attachments: {e}")))?,
+            Err(ureq::Error::Status(code, r)) => {
+                let text = r.into_string().unwrap_or_default();
+                let hint = if code == 413 { " (файл слишком большой для Asana — лимит 100 MB)" } else { "" };
+                return Err(ApiError(format!("загрузка «{}» отклонена: HTTP {code}{hint}: {text}", up.name)));
+            }
+            Err(e) => return Err(ApiError(format!("загрузка «{}» не удалась: {e}", up.name))),
+        };
+        let d = &v["data"];
+        Ok(Attachment {
+            gid: d["gid"].as_str().unwrap_or_default().to_string(),
+            name: d["name"].as_str().unwrap_or(&up.name).to_string(),
+            size: up.size,
+            url: None,
+        })
     }
 
     pub fn create_subtask(
