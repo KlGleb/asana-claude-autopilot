@@ -569,6 +569,91 @@ pub struct Attachment {
     pub url: Option<String>,
 }
 
+/// Файл, подготовленный к загрузке во вложения: открыт, размер и
+/// Content-Type известны заранее (нужны и gleb_tasks, и для Content-Length).
+pub struct Upload {
+    pub file: std::fs::File,
+    pub name: String,
+    pub size: u64,
+    pub content_type: &'static str,
+}
+
+impl Upload {
+    pub fn open(path: &Path, name: Option<&str>) -> Result<Upload> {
+        let file = std::fs::File::open(path).map_err(|e| ApiError(format!("{}: {e}", path.display())))?;
+        let meta = file.metadata().map_err(|e| ApiError(format!("{}: {e}", path.display())))?;
+        if !meta.is_file() {
+            return Err(ApiError(format!("{}: не обычный файл", path.display())));
+        }
+        if meta.len() == 0 {
+            return Err(ApiError(format!("{}: пустой файл — загружать нечего", path.display())));
+        }
+        let name = match name.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None => path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".into()),
+        };
+        // Тип — по имени вложения (с --name можно его переопределить), иначе по файлу.
+        let content_type = match content_type_for(&name) {
+            "application/octet-stream" => content_type_for(&path.to_string_lossy()),
+            ct => ct,
+        };
+        Ok(Upload { file, name, size: meta.len(), content_type })
+    }
+}
+
+/// Content-Type по расширению имени файла (регистр не важен).
+pub fn content_type_for(name: &str) -> &'static str {
+    let ext = Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "txt" | "log" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Размер для людей: 512 B / 3.4 KB / 120.5 MB / 1.2 GB.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut v = bytes as f64 / 1024.0;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{v:.1} {}", UNITS[i])
+}
+
+/// HTTP-агент для загрузки больших файлов: без общего таймаута запроса
+/// (видео в сотни МБ идёт минуты), но с таймаутами на соединение и каждую
+/// операцию чтения/записи, чтобы зависшее соединение не висело вечно.
+pub(crate) fn upload_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(30))
+        .timeout_read(std::time::Duration::from_secs(300))
+        .timeout_write(std::time::Duration::from_secs(300))
+        .build()
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Story {
     #[serde(default)]
@@ -732,6 +817,25 @@ impl Client {
         match &self.backend {
             Backend::Asana(a) => a.download_attachment(attachment_id, dest_dir),
             Backend::GlebTasks(g) => g.download_attachment(attachment_id, dest_dir),
+        }
+    }
+
+    /// Загружает файл во вложения задачи (потоково, без чтения в память).
+    /// `name` — имя вложения (по умолчанию — имя файла). Возвращает созданное вложение.
+    pub fn upload_attachment(&self, task_id: &str, file: &Path, name: Option<&str>) -> Result<Attachment> {
+        let up = Upload::open(file, name)?;
+        match &self.backend {
+            Backend::Asana(a) => a.upload_attachment(task_id, up),
+            Backend::GlebTasks(g) => g.upload_attachment(task_id, up),
+        }
+    }
+
+    /// Идентификатор только что загруженного вложения в том виде, в каком его
+    /// принимает `download` (и печатает контекст задачи).
+    pub fn attachment_ref(&self, task_id: &str, a: &Attachment) -> String {
+        match self.settings.tracker {
+            Tracker::Asana => a.gid.clone(),
+            Tracker::GlebTasks => format!("{task_id}/{}", a.gid),
         }
     }
 
@@ -1052,4 +1156,46 @@ pub fn extract_task_keys(text: &str, workspace_key: &str) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_type_by_extension() {
+        assert_eq!(content_type_for("run.mp4"), "video/mp4");
+        assert_eq!(content_type_for("RUN.MP4"), "video/mp4");
+        assert_eq!(content_type_for("shot.png"), "image/png");
+        assert_eq!(content_type_for("a/b/shot.jpg"), "image/jpeg");
+        assert_eq!(content_type_for("shot.JPEG"), "image/jpeg");
+        assert_eq!(content_type_for("notes.txt"), "text/plain");
+        assert_eq!(content_type_for("e2e.log"), "text/plain");
+        assert_eq!(content_type_for("page.html"), "application/octet-stream");
+        assert_eq!(content_type_for("archive.bin"), "application/octet-stream");
+        assert_eq!(content_type_for("Makefile"), "application/octet-stream");
+        assert_eq!(content_type_for(".mp4"), "application/octet-stream");
+    }
+
+    #[test]
+    fn upload_name_and_type() {
+        let dir = std::env::temp_dir().join(format!("autopilot-upload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("video.mp4");
+        std::fs::write(&f, b"1234").unwrap();
+        let up = Upload::open(&f, None).unwrap();
+        assert_eq!((up.name.as_str(), up.size, up.content_type), ("video.mp4", 4, "video/mp4"));
+        // --name без расширения: тип по исходному файлу.
+        let up = Upload::open(&f, Some("Прогон e2e")).unwrap();
+        assert_eq!((up.name.as_str(), up.content_type), ("Прогон e2e", "video/mp4"));
+        // --name с расширением: тип по имени.
+        let up = Upload::open(&f, Some("run.log")).unwrap();
+        assert_eq!(up.content_type, "text/plain");
+        let empty = dir.join("empty.txt");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(Upload::open(&empty, None).is_err());
+        assert!(Upload::open(&dir, None).is_err());
+        assert!(Upload::open(&dir.join("missing.png"), None).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

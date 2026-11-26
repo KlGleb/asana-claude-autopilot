@@ -3,10 +3,13 @@
 //! uuid, «человеческий» id — ключ вида `SAOBR-12` (принимается везде, где
 //! ожидается id). Вложения адресуются как `<задача>/<uuid вложения>`.
 
-use crate::{ApiError, Attachment, FieldValue, Membership, Ref, Result, Story, Task, User};
+use crate::{human_size, ApiError, Attachment, FieldValue, Membership, Ref, Result, Story, Task, Upload, User};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Лимит размера вложения на сервере (`createAttachmentUpload`).
+pub const MAX_ATTACHMENT_SIZE: u64 = 500 * 1024 * 1024;
 
 /// Поля задачи, общие для всех запросов.
 const TASK_FIELDS: &str = "id key title description completed dueDate \
@@ -396,6 +399,68 @@ impl GlebTasksApi {
         let url = a.url.ok_or_else(|| ApiError("вложение без ссылки (хранилище не настроено)".into()))?;
         let short: String = a.gid.chars().take(8).collect();
         crate::asana::download_signed(&self.agent, &url, dest_dir, &format!("{short}-{}", a.name))
+    }
+
+    /// Загрузка вложения: `createAttachmentUpload` → `PUT` байтов (потоково, с тем же
+    /// Content-Type) на подписанный uploadUrl → `finalizeAttachment`.
+    pub fn upload_attachment(&self, id_or_key: &str, up: Upload) -> Result<Attachment> {
+        if up.size > MAX_ATTACHMENT_SIZE {
+            return Err(ApiError(format!(
+                "«{}» весит {} — больше лимита вложений gleb_tasks (500 MB); \
+                 сожми файл (для видео — ниже разрешение/битрейт) или разбей на части",
+                up.name,
+                human_size(up.size)
+            )));
+        }
+        let id = self.resolve_task_id(id_or_key)?;
+        if id.is_empty() {
+            return Err(ApiError(format!("задача {id_or_key} не найдена")));
+        }
+        let v = self.gql(
+            "mutation($t: ID!, $n: String!, $c: String!, $s: Int!) { \
+                createAttachmentUpload(taskId: $t, filename: $n, contentType: $c, size: $s) { \
+                    attachment { id } uploadUrl } }",
+            json!({ "t": id, "n": up.name, "c": up.content_type, "s": up.size }),
+        )
+        .map_err(|e| ApiError(format!("не удалось начать загрузку «{}»: {e}", up.name)))?;
+        let att_id = v["createAttachmentUpload"]["attachment"]["id"].as_str().unwrap_or_default().to_string();
+        let upload_url = v["createAttachmentUpload"]["uploadUrl"].as_str().unwrap_or_default();
+        if att_id.is_empty() || upload_url.is_empty() {
+            return Err(ApiError("createAttachmentUpload не вернул id/uploadUrl".into()));
+        }
+        // Дисковое хранилище отдаёт относительный путь /files/... того же origin.
+        let upload_url = if upload_url.starts_with('/') {
+            format!("{}{upload_url}", self.url)
+        } else {
+            upload_url.to_string()
+        };
+        // Подписанный URL — без Authorization; Content-Length вручную, чтобы ureq
+        // не включил chunked (S3 presigned PUT его не принимает).
+        let size = up.size;
+        let resp = crate::upload_agent()
+            .put(&upload_url)
+            .set("Content-Type", up.content_type)
+            .set("Content-Length", &size.to_string())
+            .send(up.file);
+        match resp {
+            Ok(_) => {}
+            Err(ureq::Error::Status(code, r)) => {
+                let text: String = r.into_string().unwrap_or_default().chars().take(500).collect();
+                return Err(ApiError(format!("загрузка «{}» отклонена хранилищем: HTTP {code} {text}", up.name)));
+            }
+            Err(e) => return Err(ApiError(format!("загрузка «{}» не удалась: {e}", up.name))),
+        }
+        let v = self.gql(
+            "mutation($id: ID!) { finalizeAttachment(id: $id) { id filename size url } }",
+            json!({ "id": att_id }),
+        )?;
+        let a = &v["finalizeAttachment"];
+        Ok(Attachment {
+            gid: a["id"].as_str().unwrap_or(&att_id).to_string(),
+            name: a["filename"].as_str().unwrap_or(&up.name).to_string(),
+            size: a["size"].as_u64().unwrap_or(size),
+            url: a["url"].as_str().map(str::to_string),
+        })
     }
 
     /// Создать подзадачу; возвращает её ключ (SAOBR-13).

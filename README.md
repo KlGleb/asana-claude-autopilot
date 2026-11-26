@@ -126,9 +126,12 @@ asana assign <gid> <operator|agent|none>
 asana complete <gid>
 asana subtask <parent> <name> [--notes <text|->] [--assignee operator|agent]
 asana download <attachment_gid> [dir]
+asana attach <gid> <file>… [--name <name>]   # upload files (test-run video, screenshots, logs) as attachments
 asana qa|done|block <gid> <comment|->   # comment + move + reassign in one call
 asana fields              # gleb_tasks: create the Model / Effort custom fields in the workspace
 ```
+
+`attach` streams the file (videos of hundreds of MB are fine), sets `Content-Type` from the extension (`mp4` → `video/mp4`, `png`, `jpg`, `txt`/`log` → `text/plain`, otherwise `application/octet-stream`) and prints `<id> — <name> (<size>)` per file, the id in the form `download` accepts. gleb_tasks: `createAttachmentUpload` → `PUT` to the signed URL → `finalizeAttachment`, limit 500 MB. Asana: multipart `POST /attachments`, limit 100 MB.
 
 ## Model & effort per task
 
