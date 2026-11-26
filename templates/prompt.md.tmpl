@@ -21,6 +21,19 @@ asana done <gid> <comment|->  # comment + move to done + assign operator (one ca
 asana block <gid> <comment|-> # comment + assign operator + move to blocked (one call)
 ```
 
+**Test reports (gleb_tasks projects only):** when you run test cases from the tracker's catalog (e2e scenarios, a manual pass), report them into a tracker **test run**, not into a comment — video and screenshots go to the case result. `tracker` is the same binary as `asana`; full help: `tracker test --help`.
+```
+tracker test cases [--suite <name>] [--key S17]…   # the catalog: key, title, platforms, automation, scenario path
+tracker test case <key>                            # one case: preconditions, steps (action / expected)
+tracker test upsert <file.json|->                  # bulk create/update cases by key (JSON array)
+tracker test run start --platform <web|ios|android> --build <b> [--release <version>] [--title <t>] <key…|--suite <name>…|--all>
+                                                   # prints the run id and URL
+tracker test result <run> <key> <passed|failed|blocked|skipped> [--step N=<status>[:<comment>]]… [--note <text|->] [--attach <file>]…
+tracker test bug <run> <key> [--step N] [--project <id|name>]   # bug task from a failed result, prints its key
+tracker test run finish <run>                      # close the run, prints the counts
+```
+Put the run URL into the task comment instead of retelling the results.
+
 For long comments/notes pass `-` and pipe via heredoc:
 ```
 asana comment 12345 - <<'EOF'

@@ -25,6 +25,7 @@ pub mod initproj;
 pub mod registry;
 pub mod runner;
 pub mod telegram;
+pub mod testing;
 
 pub use asana::BASE_URL;
 
@@ -604,6 +605,18 @@ impl Upload {
     }
 }
 
+/// Текстовый аргумент CLI: `-` = прочитать из stdin (для длинных текстов).
+pub fn read_text(arg: &str) -> String {
+    if arg == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).expect("stdin read failed");
+        buf.trim().to_string()
+    } else {
+        arg.to_string()
+    }
+}
+
 /// Content-Type по расширению имени файла (регистр не важен).
 pub fn content_type_for(name: &str) -> &'static str {
     let ext = Path::new(name)
@@ -836,6 +849,17 @@ impl Client {
         match self.settings.tracker {
             Tracker::Asana => a.gid.clone(),
             Tracker::GlebTasks => format!("{task_id}/{}", a.gid),
+        }
+    }
+
+    /// Сырой API gleb_tasks — для команд, которых нет в Asana (тест-менеджмент).
+    /// `what` — что именно не поддерживается, для текста ошибки.
+    pub(crate) fn gleb_tasks_api(&self, what: &str) -> Result<&gleb_tasks::GlebTasksApi> {
+        match &self.backend {
+            Backend::GlebTasks(g) => Ok(g),
+            Backend::Asana(_) => Err(ApiError(format!(
+                "{what} не поддерживается для tracker asana — только для gleb_tasks (tasks.gleb.at)"
+            ))),
         }
     }
 

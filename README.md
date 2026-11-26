@@ -129,9 +129,29 @@ asana download <attachment_gid> [dir]
 asana attach <gid> <file>… [--name <name>]   # upload files (test-run video, screenshots, logs) as attachments
 asana qa|done|block <gid> <comment|->   # comment + move + reassign in one call
 asana fields              # gleb_tasks: create the Model / Effort custom fields in the workspace
+asana test <…>            # gleb_tasks: test cases and test runs (see below; `asana test --help`)
 ```
 
 `attach` streams the file (videos of hundreds of MB are fine), sets `Content-Type` from the extension (`mp4` → `video/mp4`, `png`, `jpg`, `txt`/`log` → `text/plain`, otherwise `application/octet-stream`) and prints `<id> — <name> (<size>)` per file, the id in the form `download` accepts. gleb_tasks: `createAttachmentUpload` → `PUT` to the signed URL → `finalizeAttachment`, limit 500 MB. Asana: multipart `POST /attachments`, limit 100 MB.
+
+### Test cases and runs (`tracker test`, gleb_tasks only)
+
+Sessions report tests into the tracker's **test runs** (cases, per-step results, video and screenshots) instead of task comments. The workspace needs the «Релизы» (Releases) module; on an Asana project the command fails with a clear "not supported" error. The catalog of cases in the tracker is the source of truth, a case key looks like `S17`, `<run>` is the run id (or its `…/test-runs/<id>` URL).
+
+```
+tracker test cases [--suite <name>] [--key S17]…   # catalog: key, title, platforms, automation + scenario path, suite
+tracker test case <key>                            # one case: preconditions, steps (action / expected), last results
+tracker test upsert <file.json|->                  # bulk create/update cases by key
+tracker test run start --platform <web|ios|android> --build <b> [--release <version or project id>] [--title <t>] <key…|--suite <name>…|--all>
+tracker test result <run> <key> <passed|failed|blocked|skipped> [--step N=<status>[:<comment>]]… [--note <text|->] [--attach <file>]…
+tracker test run finish <run>                      # close the run (read-only afterwards), prints the counts
+tracker test bug <run> <key> [--step N] [--project <id|name>]   # bug task from a failed result, prints its key
+```
+
+- `upsert` takes a JSON array of cases (or `{"cases": […]}`) in the same shape as the tracker's MCP tool: `key` (required), `title`, `suite` (path `Parent / Child`, created if missing), `preconditions`, `steps` (`[{"action", "expected"}]`, a plain string is an action), `platforms`, `priority`, `automation_status`, `automation_ref`, `archived`. Omitted fields are kept; an unknown field is an error.
+- `run start` creates the run with source `agent` and prints its id and URL. Cases are picked by keys, by suites (`--suite`, repeatable, sub-suites included) or with `--all` (every active case of the platform). `--release` is a release version, a release project name or its id — the run then shows up on the release dashboard.
+- `result` sets the result by run + case key (a case that is not in the run yet is added). `--step` sets single steps (1-based) and keeps the others; `--attach` uploads videos / screenshots / logs as attachments of the result (same streaming upload and 500 MB limit as `attach`).
+- `bug` files the task with reproduction steps up to the failed step (default: the first failed one), the run link, the `bug` tag and the result's files; it goes to `--project` (default: the current sprint) and to the run's release. Calling it again for the same result prints the existing bug instead of creating a duplicate.
 
 ## Model & effort per task
 

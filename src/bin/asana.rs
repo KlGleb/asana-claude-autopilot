@@ -8,7 +8,6 @@
 // поэтому одна глобально установленная `asana` работает во всех проектах.
 
 use autopilot_core::*;
-use std::io::Read;
 use std::process::exit;
 
 const USAGE: &str = r#"asana — лёгкая CLI трекера задач: Asana или gleb_tasks, по `tracker:` в конфиге
@@ -43,20 +42,22 @@ const USAGE: &str = r#"asana — лёгкая CLI трекера задач: Asa
                                        (SELECT, для исполнителя Claude Code, необязательные) —
                                        из них демон берёт модель и эффорт сессии. Имена полей
                                        настраиваются в autopilot.yaml: fields: {model, effort}.
+  asana test <…>                       (gleb_tasks) Тест-кейсы и прогоны: отчёт о тестах в
+                                       прогон трекера вместо комментариев. Подробно:
+                                       `asana test --help`.
+      test cases [--suite <имя>] [--key S17]…       список кейсов
+      test case <key>                               кейс целиком (шаги, платформы, сценарий)
+      test upsert <file.json|->                     массовый upsert кейсов по key
+      test run start --platform <web|ios|android> --build <b> [--release <версия|id>]
+                     [--title <t>] <key…|--suite <имя>…|--all>   → id и URL прогона
+      test result <run> <key> <passed|failed|blocked|skipped>
+                     [--step N=<status>[:<комментарий>]]… [--note <text|->] [--attach <file>]…
+      test run finish <run>                         завершить прогон
+      test bug <run> <key> [--step N] [--project <id|имя>]       → ключ задачи-бага
 
 Токен: env-переменная из autopilot.yaml (asana.token_env, по умолчанию ASANA_ACCESS_TOKEN;
 для gleb_tasks — gleb_tasks.api_key_env, по умолчанию GLEB_TASKS_API_KEY).
 "#;
-
-fn read_text(arg: &str) -> String {
-    if arg == "-" {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).expect("stdin read failed");
-        buf.trim().to_string()
-    } else {
-        arg.to_string()
-    }
-}
 
 fn die(msg: &str) -> ! {
     eprintln!("ERROR: {msg}");
@@ -143,6 +144,22 @@ fn project_of(client: &Client, gid: &str) -> Result<String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `asana test …` — тест-менеджмент gleb_tasks: своя справка, а аргументы
+    // разбираются до загрузки конфига (ошибка в них не должна стоить запроса в сеть).
+    if args.first().is_some_and(|a| a == "test") {
+        let rest = &args[1..];
+        let help = rest.iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h");
+        if rest.is_empty() || rest[0] == "help" || help {
+            print!("{}", testing::USAGE);
+            return;
+        }
+        let cmd = testing::parse(rest).unwrap_or_else(|e| die(&e));
+        let client = Client::load().unwrap_or_else(|e| die(&e.to_string()));
+        if let Err(e) = testing::execute(&client, cmd) {
+            die(&e.to_string());
+        }
+        return;
+    }
     // `asana <команда> --help|-h` — та же общая справка (до загрузки конфига).
     let sub_help = args.get(1).is_some_and(|a| a == "--help" || a == "-h");
     if args.is_empty() || args[0] == "help" || args[0] == "--help" || args[0] == "-h" || sub_help {
