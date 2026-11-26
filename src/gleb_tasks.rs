@@ -401,9 +401,24 @@ impl GlebTasksApi {
         crate::asana::download_signed(&self.agent, &url, dest_dir, &format!("{short}-{}", a.name))
     }
 
-    /// Загрузка вложения: `createAttachmentUpload` → `PUT` байтов (потоково, с тем же
+    /// Загрузка вложения задачи: `createAttachmentUpload` → `PUT` байтов (потоково, с тем же
     /// Content-Type) на подписанный uploadUrl → `finalizeAttachment`.
     pub fn upload_attachment(&self, id_or_key: &str, up: Upload) -> Result<Attachment> {
+        Self::check_upload_size(&up)?;
+        let id = self.resolve_task_id(id_or_key)?;
+        if id.is_empty() {
+            return Err(ApiError(format!("задача {id_or_key} не найдена")));
+        }
+        self.upload_to("taskId", &id, up)
+    }
+
+    /// Вложение результата тест-кейса (видео, скриншоты, логи прогона кейса).
+    pub fn upload_result_attachment(&self, result_id: &str, up: Upload) -> Result<Attachment> {
+        Self::check_upload_size(&up)?;
+        self.upload_to("testResultId", result_id, up)
+    }
+
+    fn check_upload_size(up: &Upload) -> Result<()> {
         if up.size > MAX_ATTACHMENT_SIZE {
             return Err(ApiError(format!(
                 "«{}» весит {} — больше лимита вложений gleb_tasks (500 MB); \
@@ -412,17 +427,19 @@ impl GlebTasksApi {
                 human_size(up.size)
             )));
         }
-        let id = self.resolve_task_id(id_or_key)?;
-        if id.is_empty() {
-            return Err(ApiError(format!("задача {id_or_key} не найдена")));
-        }
-        let v = self.gql(
-            "mutation($t: ID!, $n: String!, $c: String!, $s: Int!) { \
-                createAttachmentUpload(taskId: $t, filename: $n, contentType: $c, size: $s) { \
-                    attachment { id } uploadUrl } }",
-            json!({ "t": id, "n": up.name, "c": up.content_type, "s": up.size }),
-        )
-        .map_err(|e| ApiError(format!("не удалось начать загрузку «{}»: {e}", up.name)))?;
+        Ok(())
+    }
+
+    /// Загрузка владельцу `owner_arg` (`taskId` | `testRunId` | `testResultId`) с id `owner_id`.
+    fn upload_to(&self, owner_arg: &str, owner_id: &str, up: Upload) -> Result<Attachment> {
+        let q = format!(
+            "mutation($o: ID!, $n: String!, $c: String!, $s: Int!) {{ \
+                createAttachmentUpload({owner_arg}: $o, filename: $n, contentType: $c, size: $s) {{ \
+                    attachment {{ id }} uploadUrl }} }}"
+        );
+        let v = self
+            .gql(&q, json!({ "o": owner_id, "n": up.name, "c": up.content_type, "s": up.size }))
+            .map_err(|e| ApiError(format!("не удалось начать загрузку «{}»: {e}", up.name)))?;
         let att_id = v["createAttachmentUpload"]["attachment"]["id"].as_str().unwrap_or_default().to_string();
         let upload_url = v["createAttachmentUpload"]["uploadUrl"].as_str().unwrap_or_default();
         if att_id.is_empty() || upload_url.is_empty() {
@@ -567,6 +584,147 @@ impl GlebTasksApi {
                 name: s["name"].as_str().unwrap_or_default().to_string(),
             })
             .collect())
+    }
+}
+
+// ---- Тест-менеджмент (модуль «Релизы»): кейсы, прогоны, результаты ----
+//
+// Сырые вызовы для `tracker test …` (см. `crate::testing`). Возвращают JSON
+// как есть: вывод и разбор аргументов живут в `testing.rs`.
+
+/// Поля кейса для списка.
+const CASE_LIST_FIELDS: &str = "key title platforms priority automationStatus automationRef version suite { id name }";
+/// Счётчики прогона.
+const RUN_COUNTS: &str = "counts { total untested passed failed blocked skipped }";
+/// Результат кейса в прогоне.
+const RESULT_FIELDS: &str = "id key title status comment bugTask { key } steps { step action status comment }";
+
+impl GlebTasksApi {
+    /// GraphQL-запрос тест-менеджмента: к ошибке «модуль выключен» добавляется подсказка.
+    fn test_gql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.gql(query, variables).map_err(|e| {
+            if e.0.contains("Releases module") {
+                ApiError(format!(
+                    "{e} — включи модуль «Релизы» в настройках workspace (тест-кейсы и прогоны работают только с ним)"
+                ))
+            } else {
+                e
+            }
+        })
+    }
+
+    /// Наборы кейсов workspace (плоский список; дерево — по parentId).
+    pub fn test_suites(&self) -> Result<Vec<Value>> {
+        let v = self.test_gql(
+            "query($w: ID!) { testSuites(workspaceId: $w) { id parentId name caseCount } }",
+            json!({ "w": self.workspace_id }),
+        )?;
+        Ok(v["testSuites"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Активные кейсы workspace (в порядке ключей), опционально — одного набора с поднаборами.
+    pub fn test_cases(&self, suite_id: Option<&str>) -> Result<Vec<Value>> {
+        const PAGE: usize = 200;
+        let q = format!(
+            "query($w: ID!, $f: TestCaseFilter, $l: Int!, $o: Int!) {{ \
+                testCases(workspaceId: $w, filter: $f, limit: $l, offset: $o) {{ total items {{ {CASE_LIST_FIELDS} }} }} }}"
+        );
+        let filter = match suite_id {
+            Some(id) => json!({ "suiteId": id }),
+            None => json!({}),
+        };
+        let mut out: Vec<Value> = Vec::new();
+        loop {
+            let v = self.test_gql(&q, json!({ "w": self.workspace_id, "f": filter, "l": PAGE, "o": out.len() }))?;
+            let page = v["testCases"]["items"].as_array().cloned().unwrap_or_default();
+            let total = v["testCases"]["total"].as_u64().unwrap_or(0) as usize;
+            let got = page.len();
+            out.extend(page);
+            if got < PAGE || out.len() >= total {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Кейс целиком по ключу (S17).
+    pub fn test_case(&self, key: &str) -> Result<Value> {
+        let v = self.test_gql(
+            "query($w: ID!, $k: String!) { testCase(workspaceId: $w, key: $k) { \
+                key title preconditions steps { action expected } platforms priority \
+                automationStatus automationRef version archivedAt suite { id name } \
+                lastResults { status updatedAt run { id platform build } } } }",
+            json!({ "w": self.workspace_id, "k": key }),
+        )?;
+        Ok(v["testCase"].clone())
+    }
+
+    /// Массовый upsert кейсов по key (`cases` — массив TestCaseInput).
+    pub fn upsert_test_cases(&self, cases: Value) -> Result<Value> {
+        let v = self.test_gql(
+            "mutation($w: ID!, $c: [TestCaseInput!]!) { upsertTestCases(workspaceId: $w, cases: $c) { \
+                created updated unchanged cases { key version } } }",
+            json!({ "w": self.workspace_id, "c": cases }),
+        )?;
+        Ok(v["upsertTestCases"].clone())
+    }
+
+    /// Создать прогон (`input` — CreateTestRunInput без workspaceId).
+    pub fn create_test_run(&self, mut input: Value) -> Result<Value> {
+        input["workspaceId"] = json!(self.workspace_id);
+        let q = format!(
+            "mutation($i: CreateTestRunInput!) {{ createTestRun(input: $i) {{ id title platform build status {RUN_COUNTS} }} }}"
+        );
+        let v = self.test_gql(&q, json!({ "i": input }))?;
+        Ok(v["createTestRun"].clone())
+    }
+
+    /// Прогон с результатами.
+    pub fn test_run(&self, id: &str) -> Result<Value> {
+        let q = format!(
+            "query($id: ID!) {{ testRun(id: $id) {{ id title platform build status {RUN_COUNTS} results {{ {RESULT_FIELDS} }} }} }}"
+        );
+        let v = self.test_gql(&q, json!({ "id": id }))?;
+        Ok(v["testRun"].clone())
+    }
+
+    /// `setTestResult`: `vars` — resultId | runId + caseKey, status, comment, stepResults
+    /// (отсутствующие = не менять). Кейс, которого ещё нет в прогоне, добавляется.
+    pub fn set_test_result(&self, vars: Value) -> Result<Value> {
+        let q = format!(
+            "mutation($resultId: ID, $runId: ID, $caseKey: String, $status: TestResultStatus, $comment: String, \
+                $stepResults: [TestStepResultInput!]) {{ \
+                setTestResult(resultId: $resultId, runId: $runId, caseKey: $caseKey, status: $status, \
+                    comment: $comment, stepResults: $stepResults) {{ {RESULT_FIELDS} }} }}"
+        );
+        let v = self.test_gql(&q, vars)?;
+        Ok(v["setTestResult"].clone())
+    }
+
+    /// Завершить прогон (результаты становятся read-only).
+    pub fn finish_test_run(&self, id: &str) -> Result<Value> {
+        let q = format!("mutation($id: ID!) {{ finishTestRun(id: $id) {{ id title status {RUN_COUNTS} }} }}");
+        let v = self.test_gql(&q, json!({ "id": id }))?;
+        Ok(v["finishTestRun"].clone())
+    }
+
+    /// Задача-баг из результата; `step` — 1-based (None = первый упавший/заблокированный шаг).
+    pub fn create_bug_from_result(&self, result_id: &str, step: Option<u32>, project_id: &str) -> Result<Value> {
+        let v = self.test_gql(
+            "mutation($r: ID!, $s: Int, $p: ID!) { createBugFromResult(resultId: $r, step: $s, projectId: $p) { key title } }",
+            json!({ "r": result_id, "s": step, "p": project_id }),
+        )?;
+        Ok(v["createBugFromResult"].clone())
+    }
+
+    /// Проекты workspace (включая архивные) с группой и релизом + текущий спринт —
+    /// для резолва `--release <версия>` и `--project <имя>`.
+    pub fn workspace_projects(&self) -> Result<Value> {
+        let v = self.gql(
+            "query($w: ID!) { workspace(id: $w) { currentSprint { id name } \
+                projects(includeArchived: true) { id name archivedAt createdAt group { kind } release { version } } } }",
+            json!({ "w": self.workspace_id }),
+        )?;
+        Ok(v["workspace"].clone())
     }
 }
 
