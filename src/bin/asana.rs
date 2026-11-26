@@ -143,7 +143,9 @@ fn project_of(client: &Client, gid: &str) -> Result<String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() || args[0] == "help" || args[0] == "--help" {
+    // `asana <команда> --help|-h` — та же общая справка (до загрузки конфига).
+    let sub_help = args.get(1).is_some_and(|a| a == "--help" || a == "-h");
+    if args.is_empty() || args[0] == "help" || args[0] == "--help" || args[0] == "-h" || sub_help {
         print!("{USAGE}");
         return;
     }
